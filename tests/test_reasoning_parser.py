@@ -1868,3 +1868,35 @@ class TestMuseGlimmerParser:
         """A partial header withheld at stream end is delivered, not dropped."""
         _, content = self._stream(parser, " to=selfR<|eom|>" + tail, 1)
         assert content == tail
+
+    # Bare-header tests: the model sometimes skips the ``to=self`` reasoning
+    # block entirely on 2nd+ turns and opens straight with a bare
+    # ``to=user``/``to=<tool>`` header (no ``assistant `` prefix, since it's
+    # the first channel of the turn). The literal header must not leak into
+    # reasoning or content.
+
+    BARE_USER = "to=user<|message|>Good morning"
+    BARE_TOOL = (
+        "to=some_tool<|message|><atem:function_calls>\n"
+        '<atem:invoke name="some_tool">\n'
+        '<atem:parameter name="x">1</atem:parameter>\n</atem:invoke>\n'
+        "</atem:function_calls>"
+    )
+
+    @pytest.mark.parametrize("chunk", [1, 2, 3, 4, 5, 7, 16])
+    def test_streaming_bare_user_header_split_across_deltas(self, parser, chunk):
+        """The header must resolve correctly regardless of delta boundaries,
+        including splits mid-header (e.g. ``to=us`` then ``er...``)."""
+        reasoning, content = self._stream(parser, self.BARE_USER, chunk)
+        assert not reasoning
+        assert content == "Good morning"
+
+    def test_streaming_bare_tool_header_without_self_block(self, parser):
+        """A turn opening straight into a tool call, no reasoning block at all."""
+        reasoning, content = self._stream(parser, self.BARE_TOOL, 1)
+        assert not reasoning
+        assert content.startswith("<atem:function_calls>")
+        assert "to=" not in content
+
+    def test_non_streaming_bare_user_header(self, parser):
+        assert parser.extract_reasoning("to=userGood morning") == (None, "Good morning")
