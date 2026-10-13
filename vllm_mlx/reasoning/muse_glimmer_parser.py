@@ -40,6 +40,9 @@ _HEADER = "assistant to="
 # tool call -- skipping ``to=self`` -- is bare, not ``assistant``-prefixed.
 _BARE_HEADER = "to="
 _RECIPIENT_RE = re.compile(r"[\w.\-]*")
+_RECIPIENT_WORD_CHARS = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-"
+)
 
 
 def _header_pattern(prefix: str) -> re.Pattern[str]:
@@ -54,6 +57,42 @@ _HEADER_PATTERNS = {
     _HEADER: _header_pattern(_HEADER),
     _BARE_HEADER: _header_pattern(_BARE_HEADER),
 }
+
+# Where an unfinished tool-call block starts: the whole tail from the block
+# marker on is dropped (non-streaming) or withheld (streaming) whenever no
+# ``</atem:function_calls>`` follows, so a max_tokens cut inside a block can
+# never leak markup as visible content.
+_CALLS_OPEN_RE = re.compile(
+    r"<atem:function_calls>(?!.*</atem:function_calls>)", re.DOTALL
+)
+
+_CALLS_END = "</atem:function_calls>"
+_INVOKE_END = "</atem:invoke>"
+
+# A channel header directly in front of an unfinished block belongs to the
+# tool channel, so it is held/dropped with the block instead of leaking as
+# reply text.
+_PRE_HEADER_RE = re.compile(
+    r"(?:<\|message\|>\s*)?(?:assistant\s+)?to=[\w.\-]+\s*(?:<\|message\|>\s*)?$"
+)
+
+
+def _split_at_unfinished_call(text: str) -> tuple[str, str]:
+    """Split ``text`` at the start of an unfinished tool-call block.
+
+    Returns ``(visible, tail)`` where ``tail`` starts at an
+    ``<atem:function_calls>`` with no later ``</atem:function_calls>``
+    (empty when every opened block is closed). Any channel header directly
+    in front of the unfinished block stays with the tail.
+    """
+    match = _CALLS_OPEN_RE.search(text)
+    if not match:
+        return text, ""
+    start = match.start()
+    header = _PRE_HEADER_RE.search(text, 0, start)
+    if header and header.group().strip():
+        start = header.start()
+    return text[:start], text[start:]
 
 
 def _strip_header(content: str, prefix: str = _HEADER) -> str:
@@ -73,6 +112,45 @@ def _header_incomplete(text: str, prefix: str = _HEADER) -> bool:
     return _TOOL_CALLS.startswith(rest) and rest != _TOOL_CALLS
 
 
+def _self_channel_state(text: str) -> bool | None:
+    """Classify whether ``text`` opens the reasoning channel.
+
+    Returns True (genuine ``to=self``), False (a tool/user channel header), or
+    None while the text can still grow into a tool channel -- withhold, don't
+    commit.
+
+    ``to=self`` is a prefix of the legal tool recipient ``self_check``, so a
+    substring test cannot distinguish them; this routes through the same
+    complete-marker machinery used for every other recipient. Once ``to=self``
+    is complete it commits to the reasoning channel even if a call marker
+    follows -- that marker is then an example inside reasoning. A markerless
+    ``to=self_check`` resolves True too; per ATEM a tool channel's body is its
+    marker, so such a channel is malformed either way and misreading it as
+    reasoning is harmless.
+    """
+    stripped = text.lstrip()
+    if not stripped.startswith(_BARE_HEADER):
+        return False
+    after = stripped[len(_BARE_HEADER) :]
+    if after == "":
+        return None
+    m = _RECIPIENT_RE.match(after)
+    name = after[: m.end()] if m else ""
+    tail = after[m.end() :].lstrip() if m else after
+    if name == "self":
+        # ``self_check`` continues the name, so ``to=self`` is still ambiguous.
+        if tail and tail[:1] in _RECIPIENT_WORD_CHARS:
+            return None
+        return True
+    if _header_incomplete(stripped, _BARE_HEADER):
+        return None
+    if _HEADER_PATTERNS[_BARE_HEADER].match(stripped):
+        return False
+    # No marker followed: ``to=self`` with content run straight onto it
+    # (``to=selfThe plan…``) is still the reasoning channel.
+    return stripped.startswith("to=self")
+
+
 class MuseGlimmerReasoningParser(BaseThinkingReasoningParser):
     """
     Reasoning parser for Muse Glimmer's ATEM channels.
@@ -90,6 +168,16 @@ class MuseGlimmerReasoningParser(BaseThinkingReasoningParser):
     def end_token(self) -> str:
         return "<|eom|>"
 
+    def __init__(self, tokenizer=None):
+        super().__init__(tokenizer)
+        self.reset_state()
+
+    def reset_state(self, implicit_mode: bool = False):
+        super().reset_state(implicit_mode)
+        # Trailing text withheld while an <atem:function_calls> block is open;
+        # dropped at stream end (a cut-off block never becomes content).
+        self._calls_hold = ""
+
     def extract_reasoning(
         self,
         model_output: str,
@@ -102,14 +190,27 @@ class MuseGlimmerReasoningParser(BaseThinkingReasoningParser):
             # a bare channel header (``to=user`` or a tool) -- strip it rather
             # than let the base class's no-tags fallback leak it as content.
             stripped = text.lstrip()
-            if stripped.startswith(_BARE_HEADER) and not stripped.startswith(
-                self.start_token
-            ):
+            state = _self_channel_state(stripped)
+            if state is False:
                 return None, _strip_header(stripped, _BARE_HEADER).strip() or None
+            # state True (truncated reasoning) or None (ambiguous prefix such
+            # as ``to=self`` that a complete output can no longer grow into a
+            # tool channel): leave to the base class.
             return super().extract_reasoning(text)
         # The reasoning message ends at <|eom|>; one reply or tool message follows.
+        state = _self_channel_state(text)
+        if state is False:
+            # Output skipped the reasoning channel (bare tool/user header):
+            # nothing is reasoning; the tool parser strips call markup later.
+            return None, _strip_header(text.lstrip(), _BARE_HEADER).strip() or None
         reasoning, _, content = text.partition(self.end_token)
         reasoning = reasoning.strip().removeprefix(self.start_token).strip()
+        visible, tail = _split_at_unfinished_call(content)
+        if not tail and _TOOL_CALLS in visible:
+            # Only an *example* call markup inside a (possibly redirected)
+            # reasoning channel: keep it verbatim for the tool parser.
+            visible = content
+        content = visible
         return reasoning or None, _strip_header(content).strip() or None
 
     def extract_reasoning_streaming(
@@ -123,13 +224,19 @@ class MuseGlimmerReasoningParser(BaseThinkingReasoningParser):
         delta_text = _FRAMING_RE.sub("", delta_text)
 
         if self._phase == "pre_think":
-            if self.start_token in current_text:
-                # The reasoning block opened after all; hand the base class
-                # anything withheld below plus this delta so it can find the
-                # (possibly split) start token as one piece of text.
-                if self._content_buffer:
-                    delta_text = self._content_buffer + delta_text
-                    self._content_buffer = ""
+            head = (self._content_buffer + delta_text).lstrip()
+            state = _self_channel_state(head)
+            if state is None:
+                # Ambiguous: ``to=self`` might still resolve into
+                # ``to=self_check``; hold until the header resolves.
+                self._content_buffer = head
+                return None
+            if state:
+                # Genuine reasoning channel; hand the base class everything
+                # withheld plus this delta so it can find the (possibly
+                # split) start token as one piece of text.
+                delta_text = head
+                self._content_buffer = ""
             else:
                 return self._pre_think_bare_header(delta_text)
 
@@ -152,7 +259,9 @@ class MuseGlimmerReasoningParser(BaseThinkingReasoningParser):
             return None
         buffer = (self._content_buffer + delta_text).lstrip()
         self._content_buffer = ""
-        if _header_incomplete(buffer, _BARE_HEADER):
+        if _header_incomplete(buffer, _BARE_HEADER) or (
+            _self_channel_state(buffer) is None
+        ):
             self._content_buffer = buffer
             return None
         if buffer.startswith(_BARE_HEADER):
@@ -165,15 +274,49 @@ class MuseGlimmerReasoningParser(BaseThinkingReasoningParser):
         return super().extract_reasoning_streaming("", buffer, buffer)
 
     def _content_delta(self, delta_text: str) -> DeltaMessage | None:
-        if self._content_started:
-            return super()._content_delta(delta_text)
+        if self._content_started or self._calls_hold:
+            return self._calls_guard(delta_text)
         # Withhold the channel header until it can be removed whole.
         buffer = (self._content_buffer + delta_text).lstrip()
         self._content_buffer = ""
         if _header_incomplete(buffer):
             self._content_buffer = buffer
             return None
-        return super()._content_delta(_strip_header(buffer))
+        return self._calls_guard(_strip_header(buffer))
+
+    def _calls_guard(self, delta_text: str) -> DeltaMessage | None:
+        """Emit ``delta_text`` unless it ends inside an unfinished block.
+
+        A tool-call block that has opened but not closed is withheld (streaming)
+        or dropped (non-streaming, via ``extract_reasoning``) so a max_tokens
+        cut inside a block can never leak markup as visible content. A block
+        that closes is released verbatim for the tool parser downstream.
+        """
+        combined = self._calls_hold + delta_text
+        self._calls_hold = ""
+        if not combined:
+            return None
+        idx = combined.find(_TOOL_CALLS)
+        if idx == -1:
+            # Hold a trailing run that could still grow into the marker.
+            for n in range(min(len(_TOOL_CALLS) - 1, len(combined)), 0, -1):
+                if combined.endswith(_TOOL_CALLS[:n]):
+                    visible, self._calls_hold = combined[:-n], combined[-n:]
+                    break
+            else:
+                visible, self._calls_hold = combined, ""
+            return super()._content_delta(visible) if visible else None
+        visible, rest = combined[:idx], combined[idx:]
+        if _CALLS_END in rest:
+            return super()._content_delta(_strip_header(visible + rest))
+        if _INVOKE_END in rest:
+            # The invoke itself closed; the block wrapper may yet arrive, but
+            # the call is already extractable -- release what is complete
+            # (matching non-streaming, which accepts unwrapped blocks) instead
+            # of holding markup that a max_tokens cut would drop entirely.
+            return super()._content_delta(_strip_header(visible + rest))
+        visible, self._calls_hold = _split_at_unfinished_call(combined)
+        return super()._content_delta(visible) if visible else None
 
     def finalize_stream(self) -> DeltaMessage | None:
         if not self._content_started and self._content_buffer:
@@ -184,4 +327,15 @@ class MuseGlimmerReasoningParser(BaseThinkingReasoningParser):
             # ever opened, an ``assistant``-prefixed one after it did.
             prefix = _BARE_HEADER if self._phase == "pre_think" else _HEADER
             return DeltaMessage(content=_strip_header(leftover, prefix) or None)
+        # At stream end the held tail can no longer grow into a marker: emit
+        # it as content unless it is a cut-off block's tail, which stays
+        # suppressed exactly as in non-streaming mode.
+        if self._calls_hold:
+            hold, self._calls_hold = self._calls_hold, ""
+            if _TOOL_CALLS in hold and _CALLS_END not in hold:
+                return super().finalize_stream()
+            # Emit via the base content path: _calls_guard would re-withhold
+            # text that is final now.
+            delta = super()._content_delta(hold)
+            return delta if delta else super().finalize_stream()
         return super().finalize_stream()

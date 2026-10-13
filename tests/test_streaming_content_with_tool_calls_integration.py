@@ -736,3 +736,55 @@ class TestRealMuseGlimmerParsers:
         assert len(calls) == 1
         assert calls[0]["function"]["name"] == "get_weather"
         assert json.loads(calls[0]["function"]["arguments"]) == {"city": "Paris"}
+
+    # A self-prefixed tool recipient split across deltas: the ``to=self``
+    # prefix must stay ambiguous until ``_check`` rules out reasoning.
+    SELF_CHECK_CALL = [
+        " to=self",
+        "<|message|>",
+        "Check",
+        ".",
+        "<|eom|>",
+        "<|start|>",
+        "assistant",
+        " to=self_",
+        "check",
+        "<|message|>",
+        "<atem:",
+        "function_calls>",
+        '<atem:invoke name="self_check">',
+        '<atem:parameter name="x">1</atem:parameter>',
+        "</atem:invoke>",
+        "</atem:function_calls>",
+    ]
+
+    @pytest.mark.anyio
+    async def test_self_prefixed_tool_recipient_split_deltas(self, monkeypatch):
+        deltas = await self._stream(monkeypatch, self.SELF_CHECK_CALL)
+        assert "".join(d.get("content") or "" for d in deltas) == ""
+        assert "".join(d.get("reasoning_content") or "" for d in deltas) == "Check."
+        calls = [call for d in deltas for call in (d.get("tool_calls") or [])]
+        assert [(c["function"]["name"], c["function"]["arguments"]) for c in calls] == [
+            ("self_check", '{"x": 1}')
+        ]
+
+    # Call markup quoted in reasoning prose must not become a call: with
+    # TOOL_MARKUP_IN_REASONING=False the server never redirects reasoning
+    # into the tool stream, so the example stays reasoning.
+    CALL_EXAMPLE_IN_REASONING = [
+        "to=selfI could call <atem:function_calls>",
+        '<atem:invoke name="get_weather">',
+        '<atem:parameter name="city">Paris</atem:parameter>',
+        "</atem:invoke></atem:function_calls>, but no call is needed.<|eom|>",
+        "assistant to=userNo action needed.",
+    ]
+
+    @pytest.mark.anyio
+    async def test_tool_example_in_reasoning_never_becomes_a_call(self, monkeypatch):
+        deltas = await self._stream(monkeypatch, self.CALL_EXAMPLE_IN_REASONING)
+        reasoning = "".join(d.get("reasoning_content") or "" for d in deltas)
+        assert "I could call" in reasoning
+        assert '<atem:invoke name="get_weather">' in reasoning
+        calls = [call for d in deltas for call in (d.get("tool_calls") or [])]
+        assert calls == []
+        assert "".join(d.get("content") or "" for d in deltas) == "No action needed."

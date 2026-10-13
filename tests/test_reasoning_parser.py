@@ -1780,6 +1780,17 @@ class TestMuseGlimmerParser:
         '<atem:parameter name="city">Paris</atem:parameter>\n</atem:invoke>\n'
         "</atem:function_calls>"
     )
+    # A ``self``-prefixed tool recipient (``to=self_check``) must not be
+    # swallowed by the ``to=self`` reasoning-channel prefix.
+    SELF_PREFIXED_TOOL_CALL = TOOL.replace("weather.get", "self_check")
+    # Call markup quoted in reasoning prose stays reasoning; the reply follows.
+    CALL_EXAMPLE_IN_REASONING = (
+        "to=selfI could call <atem:function_calls>\n"
+        '<atem:invoke name="get_weather">\n'
+        '<atem:parameter name="city">Paris</atem:parameter>\n</atem:invoke>\n'
+        "</atem:function_calls>, but no call is needed.<|eom|>assistant to=user"
+        "No action needed."
+    )
 
     @pytest.fixture
     def parser(self):
@@ -1833,12 +1844,16 @@ class TestMuseGlimmerParser:
             RAW,
             CLEANED,
             TOOL,
+            SELF_PREFIXED_TOOL_CALL,
             TOOL.replace("weather.get", "user_lookup"),
             TOOL.replace("<|message|><atem:", "<|message|>\n\n<atem:"),
             " to=selfR<|eom|>assistant to=userHello",
             " to=selfR<|eom|>assistant to=user_name is alice",
             " to=selfR<|eom|>assistant to=use",
             " to=selfR<|eom|>assistant to=get_weather",
+            CALL_EXAMPLE_IN_REASONING,
+            # ``to=self_check`` tool call as a turn opener (bare header).
+            SELF_PREFIXED_TOOL_CALL.lstrip(),
         ],
     )
     def test_streaming_matches_non_streaming(self, parser, text, chunk):
@@ -1856,6 +1871,49 @@ class TestMuseGlimmerParser:
         reasoning, content = parser.extract_reasoning(text)
         assert reasoning == "Check the weather."
         assert content.startswith("<atem:function_calls>")
+
+    def test_self_prefixed_tool_recipient_is_not_reasoning(self, parser):
+        """A bare ``to=self_check`` tool channel must not leak into reasoning."""
+        # SELF_PREFIXED_TOOL_CALL starts with a reasoning block; strip that so the parser sees
+        # the bare tool-channel opener -- the case that actually regressed.
+        bare = self.SELF_PREFIXED_TOOL_CALL.split("<|eom|>", 1)[1].lstrip()
+        reasoning, content = parser.extract_reasoning(bare)
+        assert reasoning is None
+        assert "<atem:function_calls>" in content
+        assert "_check" not in (reasoning or "") and "to=" not in content
+
+    def test_self_prefixed_tool_recipient_after_reasoning(self, parser):
+        """``to=self_check`` after a reasoning block is still a tool channel."""
+        reasoning, content = parser.extract_reasoning(
+            self.SELF_PREFIXED_TOOL_CALL.lstrip()
+        )
+        assert reasoning == "Check the weather."
+        assert content.startswith("<atem:function_calls>")
+        assert "_check" not in (reasoning or "") and "to=" not in content
+
+    def test_ambiguous_prefix_holds_then_resolves(self, parser):
+        """A stream that ends on a bare ``to=self`` resolves as no reasoning."""
+        reasoning, content = self._stream(parser, " to=self", 1)
+        assert reasoning is None
+        assert content is None
+
+    def test_tool_example_inside_reasoning_channel_is_kept(self, parser):
+        """A call example immediately after ``to=self`` is reasoning prose."""
+        reasoning, content = parser.extract_reasoning(
+            "to=self"
+            "<atem:function_calls>\n"
+            '<atem:invoke name="get_weather">\n'
+            '<atem:parameter name="city">Paris</atem:parameter>\n</atem:invoke>\n'
+            "</atem:function_calls>, but no call is needed."
+            "<|eom|>assistant to=userNo action needed."
+        )
+        assert reasoning == (
+            "<atem:function_calls>\n"
+            '<atem:invoke name="get_weather">\n'
+            '<atem:parameter name="city">Paris</atem:parameter>\n</atem:invoke>\n'
+            "</atem:function_calls>, but no call is needed."
+        )
+        assert content == "No action needed."
 
     def test_whitespace_before_tool_block(self, parser):
         """Whitespace after <|message|> does not stop the header being removed."""

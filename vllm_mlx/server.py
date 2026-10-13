@@ -6758,7 +6758,12 @@ async def stream_chat_completion(
                 # blocks, so reasoning parser captures tool call XML as
                 # reasoning while content stays None.  Redirect reasoning
                 # to the content stream so the tool parser can handle it.
-                if tool_parser and reasoning and not content:
+                if (
+                    tool_parser
+                    and reasoning
+                    and not content
+                    and tool_parser.TOOL_MARKUP_IN_REASONING
+                ):
                     _check = tool_accumulated_text + reasoning
                     if _streaming_tool_markup_possible(_check, tool_parser):
                         content = reasoning
