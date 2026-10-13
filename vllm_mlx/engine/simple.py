@@ -173,12 +173,15 @@ class SimpleEngine(BaseEngine):
         prefix_trie_cache_size: int = 32,
         prefix_trie_cache_memory_mb: int | None = None,
         default_mllm_draft: bool = False,
+        model_path: str | None = None,
     ):
         """
         Initialize the simple engine.
 
         Args:
-            model_name: HuggingFace model name or local path
+            model_name: HuggingFace model name or local path. This is the
+                model's identity: name-based defaults (thinking, Qwen3 EOS)
+                key on it.
             trust_remote_code: Whether to trust remote code
             enable_cache: Enable VLM cache for multimodal models
             force_mllm: Force loading as MLLM even if not auto-detected
@@ -200,12 +203,16 @@ class SimpleEngine(BaseEngine):
             prefix_trie_cache_memory_mb: Optional prompt-cache trie memory cap in MB
             default_mllm_draft: Enable the configured assistant drafter unless a
                 request explicitly sets ``mllm_draft`` to false.
+            model_path: Already-resolved local snapshot to load ``model_name``
+                from. Used only for loading and config.json inspection, never
+                for name heuristics. Defaults to ``model_name``.
         """
         self._model_name = model_name
+        self._model_path = model_path or model_name
         self._created_at = time.time()
         self._trust_remote_code = trust_remote_code
         self._enable_cache = enable_cache
-        self._is_mllm = force_mllm or is_mllm_model(model_name)
+        self._is_mllm = force_mllm or is_mllm_model(self._model_path)
         self._mtp = mtp
         self._mtp_num_draft_tokens = mtp_num_draft_tokens
         self._prefill_step_size = prefill_step_size
@@ -776,7 +783,7 @@ class SimpleEngine(BaseEngine):
             from ..models.mllm import MLXMultimodalLM
 
             self._model = MLXMultimodalLM(
-                self._model_name,
+                self._model_path,
                 trust_remote_code=self._trust_remote_code,
                 enable_cache=self._enable_cache,
                 max_kv_size=self._max_kv_size,
@@ -789,7 +796,8 @@ class SimpleEngine(BaseEngine):
             from ..models.llm import MLXLanguageModel
 
             self._model = MLXLanguageModel(
-                self._model_name,
+                self._model_path,
+                model_id=self._model_name,
                 trust_remote_code=self._trust_remote_code,
                 mtp=self._mtp,
                 mtp_num_draft_tokens=self._mtp_num_draft_tokens,
@@ -990,7 +998,7 @@ class SimpleEngine(BaseEngine):
 
             self._text_model = build_text_model(
                 self._model.model,
-                self._model_name,
+                self._model_path,
                 enable_mtp=self._mtp,
             )
 
@@ -1010,6 +1018,26 @@ class SimpleEngine(BaseEngine):
                 self._text_tokenizer.eos_token_id = (
                     self._text_tokenizer.convert_tokens_to_ids("<|im_end|>")
                 )
+
+            # Wrap with the full EOS set (tokenizer attrs + config.json +
+            # generation_config.json). Passing the raw HF tokenizer to
+            # mlx_lm.stream_generate makes it wrap with
+            # eos_token_ids={tokenizer.eos_token_id}, dropping turn terminators
+            # declared only in the config EOS list (Gemma 4's <turn|>=106,
+            # <|tool_response>=50) — the model then generates straight through
+            # end-of-turn until max_tokens. The hard-coded Qwen3.5 patch above
+            # is this same bug, fixed per-model. Mirrors MLLMScheduler
+            # stop-token handling on the batched path.
+            from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+            from ..utils.tokenizer import collect_eos_token_ids
+
+            eos_ids = collect_eos_token_ids(self._text_tokenizer)
+            self._text_tokenizer = TokenizerWrapper(
+                self._text_tokenizer,
+                eos_token_ids=eos_ids or None,
+            )
+            logger.info("Text route stop tokens: %s", sorted(eos_ids))
 
             # Probe the derived TextModel's prompt cache for snapshot-safety.
             # Probe args match _stream_generate_text's cache construction so a
@@ -1634,6 +1662,7 @@ class SimpleEngine(BaseEngine):
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                top_p=top_p,
                 tools=template_tools,
                 **kwargs,
             )
@@ -1676,6 +1705,88 @@ class SimpleEngine(BaseEngine):
                 completion_tokens=len(output.tokens),
                 finish_reason=output.finish_reason,
             )
+
+    def _apply_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        enable_thinking: bool | None = None,
+    ) -> str:
+        """Render a textual prompt for the server's reasoning probe."""
+        probe_kwargs = dict(chat_template_kwargs or {})
+        # The probe inspects text even when generation consumes token IDs.
+        probe_kwargs.pop("tokenize", None)
+        prompt, _, _ = self._render_chat_prompt(
+            messages, tools, probe_kwargs, enable_thinking
+        )
+        return prompt
+
+    def _render_chat_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        template_tools: list[dict] | None,
+        chat_template_kwargs: dict[str, Any],
+        enable_thinking: bool | None,
+    ) -> tuple[str, dict[str, Any] | None, list[dict[str, Any]] | None]:
+        """Return the prompt, template kwargs and normalized messages."""
+        tokenizer = self._model.tokenizer
+        template_kwargs = None
+        safe_messages = None
+        if hasattr(tokenizer, "apply_chat_template"):
+            # Per-request enable_thinking override; default: True unless coder model.
+            if enable_thinking is None:
+                enable_thinking = "coder" not in self._model_name.lower()
+            template_kwargs = {
+                "tokenize": False,
+                "add_generation_prompt": True,
+                "enable_thinking": enable_thinking,
+            }
+            if chat_template_kwargs:
+                template_kwargs.update(chat_template_kwargs)
+            if template_tools:
+                template_kwargs["tools"] = template_tools
+            safe_messages = normalize_messages_for_chat_template(messages)
+
+            if getattr(self, "use_harmony_rendering", False):
+                # GPT-OSS / harmony-format models: render via openai-harmony
+                # instead of the Jinja chat_template. Bypasses the
+                # ``extract_multimodal_content`` text-flattening upstream
+                # (which drops structural ``tool_calls`` for non-native
+                # parsers) and uses OpenAI's canonical renderer. See #568.
+                from ..utils.harmony_render import (
+                    render_messages as _harmony_render_messages,
+                )
+
+                _reasoning_effort = None
+                if chat_template_kwargs:
+                    _reasoning_effort = chat_template_kwargs.get("reasoning_effort")
+                prompt = _harmony_render_messages(
+                    safe_messages,
+                    tools=template_tools,
+                    reasoning_effort=_reasoning_effort,
+                )
+            else:
+                try:
+                    prompt = tokenizer.apply_chat_template(
+                        safe_messages, **template_kwargs
+                    )
+                except TypeError:
+                    # Some templates don't support all kwargs
+                    for key in [
+                        "tools",
+                        "enable_thinking",
+                        *chat_template_kwargs.keys(),
+                    ]:
+                        if key in template_kwargs:
+                            del template_kwargs[key]
+                    prompt = tokenizer.apply_chat_template(
+                        safe_messages, **template_kwargs
+                    )
+        else:
+            prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
+            prompt += "\nassistant:"
+        return prompt, template_kwargs, safe_messages
 
     async def stream_chat(
         self,
@@ -1777,6 +1888,7 @@ class SimpleEngine(BaseEngine):
 
         def mllm_call_kwargs() -> dict:
             local_kwargs = dict(kwargs)
+            local_kwargs["top_p"] = top_p
             if chat_template_kwargs:
                 local_kwargs["chat_template_kwargs"] = chat_template_kwargs
             local_kwargs["mllm_draft"] = mllm_draft_requested
@@ -1924,61 +2036,12 @@ class SimpleEngine(BaseEngine):
 
         # For LLM, apply chat template and stream
         tokenizer = self._model.tokenizer
-        safe_messages: list[dict[str, Any]] | None = None
-        if hasattr(tokenizer, "apply_chat_template"):
-            # Per-request enable_thinking override; default: True unless coder model.
-            enable_thinking = kwargs.pop("enable_thinking", None)
-            if enable_thinking is None:
-                enable_thinking = "coder" not in self._model_name.lower()
-            template_kwargs = {
-                "tokenize": False,
-                "add_generation_prompt": True,
-                "enable_thinking": enable_thinking,
-            }
-            if chat_template_kwargs:
-                template_kwargs.update(chat_template_kwargs)
-            if template_tools:
-                template_kwargs["tools"] = template_tools
-            safe_messages = normalize_messages_for_chat_template(messages)
-
-            if getattr(self, "use_harmony_rendering", False):
-                # GPT-OSS / harmony-format models: render via openai-harmony
-                # instead of the Jinja chat_template. Bypasses the
-                # ``extract_multimodal_content`` text-flattening upstream
-                # (which drops structural ``tool_calls`` for non-native
-                # parsers) and uses OpenAI's canonical renderer. See #568.
-                from ..utils.harmony_render import (
-                    render_messages as _harmony_render_messages,
-                )
-
-                _reasoning_effort = None
-                if chat_template_kwargs:
-                    _reasoning_effort = chat_template_kwargs.get("reasoning_effort")
-                prompt = _harmony_render_messages(
-                    safe_messages,
-                    tools=template_tools,
-                    reasoning_effort=_reasoning_effort,
-                )
-            else:
-                try:
-                    prompt = tokenizer.apply_chat_template(
-                        safe_messages, **template_kwargs
-                    )
-                except TypeError:
-                    # Some templates don't support all kwargs
-                    for key in [
-                        "tools",
-                        "enable_thinking",
-                        *chat_template_kwargs.keys(),
-                    ]:
-                        if key in template_kwargs:
-                            del template_kwargs[key]
-                    prompt = tokenizer.apply_chat_template(
-                        safe_messages, **template_kwargs
-                    )
-        else:
-            prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
-            prompt += "\nassistant:"
+        prompt, template_kwargs, safe_messages = self._render_chat_prompt(
+            messages,
+            template_tools,
+            chat_template_kwargs,
+            kwargs.pop("enable_thinking", None),
+        )
 
         # --- System-prompt KV caching on the pure-LLM stream_chat path ---
         # Mirrors the cache in _stream_generate_text. Locates the system prefix
@@ -2707,11 +2770,9 @@ class SimpleEngine(BaseEngine):
         prompt_to_send = full_prompt  # Default: send full prompt text
         cache_hit = False
         system_token_count = 0
-        full_token_count = 0
         system_hash = None
         system_tokens = None
         suffix_tokens = None
-        full_tokens_list = None
         cache_blocking_controls = []
         if not self._supports_system_kv_cache:
             cache_blocking_controls.append("non_kv_cache_class")
@@ -2722,6 +2783,18 @@ class SimpleEngine(BaseEngine):
                 "uncached path",
                 cache_blocking_controls,
             )
+
+        # Tokenize the full prompt up front so usage.prompt_tokens is always
+        # reported. Previously this only happened inside the system-KV-cache
+        # branch (which requires a system message AND ChatML markers) or for
+        # specprefill — every other request reported prompt_tokens=0.
+        _add_special = self._text_tokenizer.bos_token is None or not (
+            full_prompt.startswith(self._text_tokenizer.bos_token)
+        )
+        full_tokens_list = self._text_tokenizer.encode(
+            full_prompt, add_special_tokens=_add_special
+        )
+        full_token_count = len(full_tokens_list)
 
         # Extract system messages for caching
         has_system = any(m.get("role") == "system" for m in messages)
@@ -2743,18 +2816,10 @@ class SimpleEngine(BaseEngine):
                     :16
                 ]
 
-                # Tokenize both (matching stream_generate's tokenization logic)
-                tokenizer = self._text_tokenizer
-                add_special = tokenizer.bos_token is None or not full_prompt.startswith(
-                    tokenizer.bos_token
-                )
-                full_tokens_list = tokenizer.encode(
-                    full_prompt, add_special_tokens=add_special
-                )
-                full_token_count = len(full_tokens_list)
-
-                system_tokens_list = tokenizer.encode(
-                    system_prefix_text, add_special_tokens=add_special
+                # Tokenize the system prefix (full prompt is tokenized above,
+                # matching stream_generate's tokenization logic)
+                system_tokens_list = self._text_tokenizer.encode(
+                    system_prefix_text, add_special_tokens=_add_special
                 )
                 system_token_count = len(system_tokens_list)
 
@@ -2839,18 +2904,8 @@ class SimpleEngine(BaseEngine):
         else:
             use_specprefill = self._draft_model is not None
 
-        # For specprefill, ensure we have token IDs (not just prompt text)
-        if use_specprefill and suffix_tokens is None and full_tokens_list is None:
-            tokenizer = self._text_tokenizer
-            add_special = tokenizer.bos_token is None or not full_prompt.startswith(
-                tokenizer.bos_token
-            )
-            full_tokens_list = tokenizer.encode(
-                full_prompt, add_special_tokens=add_special
-            )
-            full_token_count = len(full_tokens_list)
-
         # Tokens for specprefill: suffix (if system KV) or full prompt
+        # (full_tokens_list is always populated by the up-front tokenization)
         specprefill_tokens = (
             suffix_tokens if suffix_tokens is not None else full_tokens_list
         )

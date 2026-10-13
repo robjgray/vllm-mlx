@@ -12,7 +12,7 @@ These models define the request and response schemas for:
 import re
 import time
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, Field, model_serializer, model_validator
 
@@ -189,6 +189,9 @@ class ChatCompletionRequest(BaseModel):
     # Tool calling
     tools: list[ToolDefinition] | None = None
     tool_choice: str | dict | None = None  # "auto", "none", or specific tool
+    # Streaming extension: buffer arguments until generation finishes before
+    # schema-aware recovery. IDs/names and content still stream immediately.
+    tool_argument_recovery: Literal["none", "buffered"] = "none"
     # Structured output
     response_format: ResponseFormat | dict | None = None
     # OpenAI-compatible token bias map: token id string -> bias value
@@ -274,6 +277,15 @@ class GenerationMetadata(BaseModel):
     no_final_content_watchdog_enforced: bool = False
     mtp_drafts: int | None = None
     mtp_accepted: int | None = None
+    specprefill_requested: bool | None = None
+    specprefill_engaged: bool | None = None
+    specprefill_reason: str | None = None
+    specprefill_route: str | None = None
+    specprefill_model_module: str | None = None
+    specprefill_language_module: str | None = None
+    specprefill_model_type: str | None = None
+    specprefill_original_tokens: int | None = None
+    specprefill_selected_tokens: int | None = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -584,3 +596,4 @@ class ChatCompletionChunk(BaseModel):
     model: str
     choices: list[ChatCompletionChunkChoice]
     usage: Usage | None = None  # Included when stream_options.include_usage=true
+    generation_metadata: GenerationMetadata | None = None
