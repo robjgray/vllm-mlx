@@ -476,6 +476,7 @@ def load_gemma4_assistant_drafter(model_path: str):
     """Load a Gemma 4 assistant drafter for mlx-vlm speculative decoding."""
     try:
         import mlx.core as mx
+        import mlx.nn as nn
         from mlx_vlm.speculative.drafters import gemma4_assistant as arch
     except ImportError as exc:
         raise ImportError(
@@ -501,13 +502,54 @@ def load_gemma4_assistant_drafter(model_path: str):
     if not weight_paths:
         raise FileNotFoundError(f"Gemma 4 assistant weights not found: {path}")
 
-    config = arch.ModelConfig.from_dict(
-        json.loads(config_path.read_text(encoding="utf-8"))
-    )
+    raw_config = json.loads(config_path.read_text(encoding="utf-8"))
+    config = arch.ModelConfig.from_dict(raw_config)
     model = arch.Model(config)
-    weights = {}
+    weights: dict = {}
     for weight_path in weight_paths:
         weights.update(mx.load(str(weight_path)))
+
+    # Quantized checkpoints store packed ``.weight`` codes plus per-group
+    # ``.scales``/``.biases`` sidecars. Build the model quantized before the
+    # strict load so those sidecars bind instead of being rejected as
+    # parameters not in model. A checkpoint with no quantization block loads
+    # unquantized as before.
+    quantization = (
+        raw_config.get("quantization")
+        or raw_config.get("quantization_config")
+        or (raw_config.get("text_config") or {}).get("quantization_config")
+    )
+    if quantization:
+        # Some configs omit ``bits``; the affine width is the default. A wrong
+        # width cannot slip through: load_weights rejects the shape mismatch.
+        group_size = quantization.get("group_size", 64)
+        bits = quantization.get("bits", 4)
+        mode = quantization.get("mode", "affine")
+
+        def _quantize_predicate(path, module):
+            if not hasattr(module, "to_quantized"):
+                return False
+            # Per-layer overrides (e.g. 8-bit routers inside a 4-bit body).
+            override = quantization.get(path)
+            if isinstance(override, dict):
+                return override
+            # Only quantize modules the checkpoint actually ships sidecars for.
+            return f"{path}.scales" in weights
+
+        nn.quantize(
+            model,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
+            class_predicate=_quantize_predicate,
+        )
+        logger.info(
+            "Quantized Gemma 4 assistant drafter: %s-bit, group_size=%s, mode=%s",
+            bits,
+            group_size,
+            mode,
+        )
+
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
     model.load_weights(list(weights.items()))
