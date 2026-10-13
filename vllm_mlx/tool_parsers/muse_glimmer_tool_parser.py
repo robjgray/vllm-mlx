@@ -284,19 +284,8 @@ class MuseGlimmerToolParser(ToolParser):
         overlap = max(0, len(previous_text) - len(_TOOL_CALLS_END) + 1)
         if current_text.find(_TOOL_CALLS_END, overlap) != -1:
             tool_calls = self.extract_tool_calls(current_text, request).tool_calls
-            emitted = [
-                {
-                    "index": i,
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {"name": tc["name"], "arguments": tc["arguments"]},
-                }
-                for i, tc in enumerate(tool_calls)
-                if i > self.current_tool_id
-            ]
-            if emitted:
-                self.current_tool_id = len(tool_calls) - 1
-                result["tool_calls"] = emitted
+            if emitted := self._new_streaming_tool_calls(tool_calls):
+                result["tool_calls"] = emitted["tool_calls"]
         return result or None
 
     def reset(self) -> None:
@@ -315,19 +304,6 @@ class MuseGlimmerToolParser(ToolParser):
         """
         if _TOOL_CALLS_START in current_text:
             final = self.extract_tool_calls(current_text, self._request)
-            emitted = [
-                {
-                    "index": i,
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {"name": tc["name"], "arguments": tc["arguments"]},
-                }
-                for i, tc in enumerate(final.tool_calls)
-                if i > self.current_tool_id
-            ]
-            if not emitted:
-                return None
-            self.current_tool_id = len(final.tool_calls) - 1
-            return {"tool_calls": emitted}
+            return self._new_streaming_tool_calls(final.tool_calls)
         held = _held_len(current_text)
         return {"content": current_text[-held:]} if held else None
