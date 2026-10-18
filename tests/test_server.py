@@ -523,6 +523,57 @@ class TestWhisperTranscriptionEndpoint:
         assert len(generated_paths) == 2
         assert all(not path.exists() for path in generated_paths)
 
+    def test_stt_model_flag_pinned_engine(self, monkeypatch):
+        from vllm_mlx.audio.stt import STTEngine
+
+        import vllm_mlx.server as srv
+
+        monkeypatch.setattr(
+            STTEngine, "load", lambda self: setattr(self, "_loaded", True)
+        )
+        monkeypatch.setattr(srv, "_stt_engine", None)
+        monkeypatch.setattr(srv, "_stt_model_locked", None)
+        srv.load_stt_model("CohereLabs/cohere-transcribe-03-2026", lock=True)
+
+        assert srv._stt_model_locked == "CohereLabs/cohere-transcribe-03-2026"
+        assert srv._stt_engine.model_name == "CohereLabs/cohere-transcribe-03-2026"
+
+    def test_stt_model_flag_rejects_other_request(self, monkeypatch):
+        import io
+        import wave
+
+        from vllm_mlx.audio.stt import STTEngine
+
+        import vllm_mlx.server as srv
+
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes(b"\x00\x00" * 20000)
+
+        monkeypatch.setattr(
+            STTEngine, "load", lambda self: setattr(self, "_loaded", True)
+        )
+        monkeypatch.setattr(srv, "_stt_engine", None)
+        monkeypatch.setattr(srv, "_stt_model_locked", None)
+        srv.load_stt_model("CohereLabs/cohere-transcribe-03-2026", lock=True)
+
+        client = TestClient(srv.app)
+        try:
+            response = client.post(
+                "/v1/audio/transcriptions",
+                params={"model": "whisper-small"},
+                files={"file": ("speech.wav", wav_buffer.getvalue(), "audio/wav")},
+            )
+            assert response.status_code == 400
+            detail = response.json()["detail"]
+            assert "CohereLabs/cohere-transcribe-03-2026" in detail
+            assert "whisper-small" in detail
+        finally:
+            client.close()
+
 
 class TestMCPExecuteEndpoint:
     """Test MCP execute endpoint sandbox routing."""

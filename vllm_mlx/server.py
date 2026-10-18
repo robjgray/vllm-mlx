@@ -1050,6 +1050,10 @@ _embedding_model_locked: str | None = None  # Set when --embedding-model is used
 _rerank_engine = None
 _rerank_model_locked: str | None = None  # Set when --rerank-model is used
 
+# Global STT engine (lazy loaded)
+_stt_engine = None
+_stt_model_locked: str | None = None  # Set when --stt-model is used
+
 # API key authentication
 _api_key: str | None = None
 _auth_warning_logged: bool = False
@@ -3992,6 +3996,34 @@ def load_reranker_model(
     _rerank_engine.load()
 
 
+def load_stt_model(
+    model_name: str | None,
+    *,
+    lock: bool = False,
+    reuse_existing: bool = True,
+) -> None:
+    """Load or reuse the STT engine when configured."""
+    global _stt_engine, _stt_model_locked
+
+    if not model_name:
+        return
+
+    if lock:
+        _stt_model_locked = model_name
+
+    if (
+        reuse_existing
+        and _stt_engine is not None
+        and _stt_engine.model_name == model_name
+    ):
+        return
+
+    from .audio.stt import STTEngine
+
+    _stt_engine = STTEngine(model_name)
+    _stt_engine.load()
+
+
 def load_model(
     model_name: str,
     use_batching: bool = False,
@@ -5008,7 +5040,6 @@ async def execute_mcp_tool(request: MCPExecuteRequest) -> MCPExecuteResponse:
 # =============================================================================
 
 # Global audio engines (lazy loaded)
-_stt_engine = None
 _tts_engine = None
 
 
@@ -5028,18 +5059,14 @@ async def create_transcription(
     - whisper-medium, whisper-small (lighter)
     - parakeet-tdt-0.6b-v2 (English, fastest)
     """
-    global _stt_engine
     tracker = _metrics.track_inference("audio_transcriptions", stream=False)
 
     try:
-        from .audio.stt import STTEngine  # Lazy import - optional feature
+        # Resolve model name before any lazy-load path is reached.
+        model_name = resolve_stt_model_name(model, locked_model=_stt_model_locked)
 
-        model_name = resolve_stt_model_name(model)
-
-        # Load engine if needed
-        if _stt_engine is None or _stt_engine.model_name != model_name:
-            _stt_engine = STTEngine(model_name)
-            _stt_engine.load()
+        # Lazy-load or swap STT engine
+        load_stt_model(model_name, lock=False, reuse_existing=True)
 
         # Stream uploaded file to disk under a hard size cap.
         tmp_path = await save_upload_with_limit(
