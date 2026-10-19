@@ -164,6 +164,10 @@ class RegisteredModel:
     specprefill_keep_pct: float | None = None
     specprefill_backbone_pct: float | None = None
     specprefill_draft_model: str | None = None
+    mllm_draft_model: str | None = None
+    mllm_draft_kind: str | None = None
+    mllm_draft_block_size: int | None = None
+    default_mllm_draft: bool | None = None
     prefix_trie_cache: bool | None = None
     prefix_trie_cache_size: int | None = None
     prefix_trie_cache_memory_mb: int | None = None
@@ -187,6 +191,10 @@ class ResolvedModelConfig:
     specprefill_keep_pct: float
     specprefill_backbone_pct: float
     specprefill_draft_model: str | None
+    mllm_draft_model: str | None
+    mllm_draft_kind: str | None
+    mllm_draft_block_size: int | None
+    default_mllm_draft: bool
     prefix_trie_cache: bool
     prefix_trie_cache_size: int
     prefix_trie_cache_memory_mb: int | None
@@ -680,6 +688,60 @@ def load_registry_config(
                     "be finite and within (0, 1]"
                 )
 
+        raw_mllm_draft_block_size = item.get("mllm_draft_block_size")
+        mllm_draft_block_size = None
+        if raw_mllm_draft_block_size is not None:
+            try:
+                mllm_draft_block_size = int(raw_mllm_draft_block_size)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"models-config entry '{name}': "
+                    "mllm_draft_block_size must be a positive integer"
+                ) from None
+            if mllm_draft_block_size <= 0:
+                raise ValueError(
+                    f"models-config entry '{name}': "
+                    "mllm_draft_block_size must be a positive integer"
+                )
+
+        mllm_draft_model = item.get("mllm_draft_model")
+        if mllm_draft_model is not None:
+            mllm_draft_model = str(mllm_draft_model)
+        mllm_draft_kind = item.get("mllm_draft_kind")
+        if mllm_draft_kind is not None:
+            mllm_draft_kind = str(mllm_draft_kind)
+        default_mllm_draft = item.get("default_mllm_draft")
+
+        if mllm_draft_model and not item.get("mllm"):
+            raise ValueError(
+                f"models-config entry '{name}': mllm_draft_model requires mllm: true"
+            )
+        if default_mllm_draft and not mllm_draft_model:
+            raise ValueError(
+                f"models-config entry '{name}': "
+                "default_mllm_draft requires mllm_draft_model"
+            )
+        resolved_continuous_batching = (
+            item.get("continuous_batching")
+            if item.get("continuous_batching") is not None
+            else defaults.continuous_batching
+        )
+        if (
+            mllm_draft_model
+            and resolved_continuous_batching
+            and mllm_draft_kind != "mtp"
+        ):
+            raise ValueError(
+                f"models-config entry '{name}': mllm_draft_model with "
+                "continuous_batching requires mllm_draft_kind: mtp"
+            )
+        if mllm_draft_model and manager.idle_unload_seconds > 0:
+            raise ValueError(
+                f"models-config entry '{name}': mllm_draft_model is not supported "
+                "with idle_unload_seconds > 0 (lifecycle residency does not "
+                "support MLLM draft models yet)"
+            )
+
         registry[name] = RegisteredModel(
             name=name,
             source=str(source),
@@ -693,6 +755,10 @@ def load_registry_config(
             specprefill_keep_pct=item.get("specprefill_keep_pct"),
             specprefill_backbone_pct=item.get("specprefill_backbone_pct"),
             specprefill_draft_model=item.get("specprefill_draft_model"),
+            mllm_draft_model=mllm_draft_model,
+            mllm_draft_kind=mllm_draft_kind,
+            mllm_draft_block_size=mllm_draft_block_size,
+            default_mllm_draft=default_mllm_draft,
             prefix_trie_cache=item.get("prefix_trie_cache"),
             prefix_trie_cache_size=item.get("prefix_trie_cache_size"),
             prefix_trie_cache_memory_mb=item.get("prefix_trie_cache_memory_mb"),
@@ -1255,6 +1321,10 @@ class ModelManager:
                 stream_interval=config.stream_interval,
                 force_mllm=config.force_mllm,
                 gpu_memory_utilization=config.gpu_memory_utilization,
+                mllm_draft_model=config.mllm_draft_model,
+                mllm_draft_kind=config.mllm_draft_kind,
+                mllm_draft_block_size=config.mllm_draft_block_size,
+                default_mllm_draft=config.default_mllm_draft,
                 specprefill_enabled=config.specprefill_enabled,
                 specprefill_threshold=config.specprefill_threshold,
                 specprefill_keep_pct=config.specprefill_keep_pct,
@@ -1272,6 +1342,10 @@ class ModelManager:
                 specprefill_keep_pct=config.specprefill_keep_pct,
                 specprefill_backbone_pct=config.specprefill_backbone_pct,
                 specprefill_draft_model=config.specprefill_draft_model,
+                mllm_draft_model=config.mllm_draft_model,
+                mllm_draft_kind=config.mllm_draft_kind,
+                mllm_draft_block_size=config.mllm_draft_block_size,
+                default_mllm_draft=config.default_mllm_draft,
                 prefix_trie_cache=config.prefix_trie_cache,
                 prefix_trie_cache_size=config.prefix_trie_cache_size,
                 prefix_trie_cache_memory_mb=config.prefix_trie_cache_memory_mb,
@@ -1404,6 +1478,10 @@ class ModelManager:
             if entry.gpu_memory_utilization is not None
             else self._defaults.gpu_memory_utilization
         )
+        mllm_draft_model = entry.mllm_draft_model
+        mllm_draft_kind = entry.mllm_draft_kind
+        mllm_draft_block_size = entry.mllm_draft_block_size
+        default_mllm_draft = bool(entry.default_mllm_draft)
         estimated_memory_bytes = self._resolve_estimated_bytes(entry, resolved_source)
 
         return ResolvedModelConfig(
@@ -1418,6 +1496,10 @@ class ModelManager:
             specprefill_keep_pct=specprefill_keep_pct,
             specprefill_backbone_pct=specprefill_backbone_pct,
             specprefill_draft_model=specprefill_draft_model,
+            mllm_draft_model=mllm_draft_model,
+            mllm_draft_kind=mllm_draft_kind,
+            mllm_draft_block_size=mllm_draft_block_size,
+            default_mllm_draft=default_mllm_draft,
             prefix_trie_cache=prefix_trie_cache,
             prefix_trie_cache_size=prefix_trie_cache_size,
             prefix_trie_cache_memory_mb=prefix_trie_cache_memory_mb,

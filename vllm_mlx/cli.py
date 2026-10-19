@@ -106,7 +106,10 @@ def serve_command(args):
     mllm_draft_block_size = getattr(args, "mllm_draft_block_size", None)
     default_mllm_draft = getattr(args, "default_mllm_draft", False)
     if mllm_draft_model and models_config:
-        print("Error: --mllm-draft-model cannot be used with --models-config")
+        print(
+            "Error: --mllm-draft-model cannot be used with --models-config; "
+            "set mllm_draft_model/mllm_draft_kind on the registry entry instead"
+        )
         sys.exit(1)
     if mllm_draft_model and not getattr(args, "mllm", False):
         print("Error: --mllm-draft-model requires --mllm")
