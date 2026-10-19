@@ -81,7 +81,21 @@ models:
     mllm: true
     continuous_batching: true
     estimated_memory_gb: 44
+
+  - name: vision-draft
+    path: /Users/david/ai-models/mlx_models/gemma-4-26b-a4b-it-4bit
+    mllm: true
+    continuous_batching: true
+    mllm_draft_model: /Users/david/ai-models/mlx_models/gemma-4-26B-A4B-MTP-MLX
+    mllm_draft_kind: mtp
+    default_mllm_draft: true
+    estimated_memory_gb: 16
 ```
+
+An entry that sets `mllm_draft_model` is rejected when `idle_unload_seconds`
+is greater than `0`; the lifecycle-residency path does not reconstruct MLLM
+draft models yet. Keep `idle_unload_seconds: 0` (the default) when a drafter
+is configured.
 
 ## Manager Settings
 
@@ -239,6 +253,10 @@ Optional:
 - `specprefill_keep_pct`
 - `specprefill_backbone_pct`
 - `specprefill_draft_model`
+- `mllm_draft_model`: optional MLLM speculative draft/assistant model path
+- `mllm_draft_kind`: optional mlx-vlm draft kind, for example `mtp`
+- `mllm_draft_block_size`: optional speculative block size for mlx-vlm (must be a positive integer)
+- `default_mllm_draft`: enable the configured assistant drafter unless a request explicitly opts out
 - `stream_interval`
 - `gpu_memory_utilization`
 - `estimated_memory_gb`

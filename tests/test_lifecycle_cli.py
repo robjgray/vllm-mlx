@@ -362,6 +362,37 @@ class TestLifecycleCli:
             capsys.readouterr().out
         )
 
+    def test_serve_command_models_config_rejection_points_to_registry_fields(
+        self, capsys
+    ):
+        """Registry-mode rejection should name the per-entry drafter fields."""
+        import vllm_mlx.cli as cli
+
+        args = SimpleNamespace(
+            model=None,
+            models_config="/tmp/models.yaml",
+            served_model_name=None,
+            enable_auto_tool_choice=False,
+            tool_call_parser=None,
+            gpu_memory_utilization=0.90,
+            max_tokens=32768,
+            max_request_tokens=32768,
+            mllm_draft_model="assistant",
+            mllm_draft_kind="mtp",
+            mllm_draft_block_size=4,
+            continuous_batching=False,
+            auto_unload_idle_seconds=0.0,
+            lazy_load_model=False,
+            mllm=True,
+        )
+
+        with pytest.raises(SystemExit):
+            cli.serve_command(args)
+
+        assert "--mllm-draft-model cannot be used with --models-config; set mllm_draft_model/mllm_draft_kind on the registry entry instead" in (
+            capsys.readouterr().out
+        )
+
     def test_serve_command_wires_auto_unload_idle_seconds_into_load_model(
         self, monkeypatch
     ):

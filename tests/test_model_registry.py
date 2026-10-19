@@ -217,6 +217,206 @@ models:
         load_registry_config(config_path, _defaults())
 
 
+def test_registry_loads_mllm_drafter_fields(tmp_path):
+    config_path = tmp_path / "models.yaml"
+    config_path.write_text("""
+manager:
+  memory_budget_gb: 8
+models:
+  - name: alpha
+    path: /tmp/alpha
+    mllm: true
+    continuous_batching: true
+    mllm_draft_model: org/draft
+    mllm_draft_kind: mtp
+    mllm_draft_block_size: 4
+    default_mllm_draft: true
+""")
+
+    _, registry = load_registry_config(config_path, _defaults())
+
+    entry = registry["alpha"]
+    assert entry.mllm_draft_model == "org/draft"
+    assert entry.mllm_draft_kind == "mtp"
+    assert entry.mllm_draft_block_size == 4
+    assert entry.default_mllm_draft is True
+
+
+def test_registry_rejects_mllm_drafter_without_mllm(tmp_path):
+    config_path = tmp_path / "models.yaml"
+    config_path.write_text("""
+manager:
+  memory_budget_gb: 8
+models:
+  - name: alpha
+    path: /tmp/alpha
+    mllm_draft_model: org/draft
+""")
+
+    with pytest.raises(
+        ValueError, match="mllm_draft_model requires mllm: true"
+    ):
+        load_registry_config(config_path, _defaults())
+
+
+def test_registry_rejects_default_mllm_draft_without_draft_model(tmp_path):
+    config_path = tmp_path / "models.yaml"
+    config_path.write_text("""
+manager:
+  memory_budget_gb: 8
+models:
+  - name: alpha
+    path: /tmp/alpha
+    mllm: true
+    default_mllm_draft: true
+""")
+
+    with pytest.raises(
+        ValueError, match="default_mllm_draft requires mllm_draft_model"
+    ):
+        load_registry_config(config_path, _defaults())
+
+
+def test_registry_rejects_mllm_drafter_with_cb_and_wrong_kind(tmp_path):
+    config_path = tmp_path / "models.yaml"
+    config_path.write_text("""
+manager:
+  memory_budget_gb: 8
+models:
+  - name: alpha
+    path: /tmp/alpha
+    mllm: true
+    mllm_draft_model: org/draft
+""")
+
+    with pytest.raises(
+        ValueError,
+        match="mllm_draft_model with continuous_batching requires mllm_draft_kind: mtp",
+    ):
+        load_registry_config(
+            config_path, _defaults_with(continuous_batching=True)
+        )
+
+
+@pytest.mark.parametrize("raw_value", ["0", "-4", "not-a-number"])
+def test_registry_rejects_invalid_mllm_draft_block_size(tmp_path, raw_value):
+    config_path = tmp_path / "models.yaml"
+    config_path.write_text(f"""
+manager:
+  memory_budget_gb: 8
+models:
+  - name: alpha
+    path: /tmp/alpha
+    mllm: true
+    mllm_draft_model: org/draft
+    mllm_draft_block_size: {raw_value}
+""")
+
+    with pytest.raises(
+        ValueError, match="mllm_draft_block_size must be a positive integer"
+    ):
+        load_registry_config(config_path, _defaults())
+
+
+def test_registry_rejects_mllm_drafter_with_idle_unload(tmp_path):
+    config_path = tmp_path / "models.yaml"
+    config_path.write_text("""
+manager:
+  memory_budget_gb: 8
+  idle_unload_seconds: 30
+models:
+  - name: alpha
+    path: /tmp/alpha
+    mllm: true
+    mllm_draft_model: org/draft
+""")
+
+    with pytest.raises(
+        ValueError,
+        match="mllm_draft_model is not supported with idle_unload_seconds > 0",
+    ):
+        load_registry_config(config_path, _defaults())
+
+
+def test_resolve_model_config_coerces_mllm_drafter_fields(tmp_path):
+    registry = _registry(tmp_path, {"alpha": 4})
+    entry = dataclasses.replace(
+        registry["alpha"],
+        mllm_draft_model="org/draft",
+        mllm_draft_kind="mtp",
+        mllm_draft_block_size=4,
+        default_mllm_draft=None,
+    )
+    manager = ModelManager(
+        _manager_config(budget_gb=8),
+        {"alpha": entry},
+        _defaults(),
+        engine_factory=lambda config: FakeEngine(config),
+    )
+
+    config = manager._resolve_model_config(entry, entry.source)
+
+    assert config.mllm_draft_model == "org/draft"
+    assert config.mllm_draft_kind == "mtp"
+    assert config.mllm_draft_block_size == 4
+    assert config.default_mllm_draft is False
+
+
+def test_resolve_model_config_defaults_mllm_drafter_fields(tmp_path):
+    registry = _registry(tmp_path, {"alpha": 4})
+    entry = registry["alpha"]
+    manager = ModelManager(
+        _manager_config(budget_gb=8),
+        registry,
+        _defaults(),
+        engine_factory=lambda config: FakeEngine(config),
+    )
+
+    config = manager._resolve_model_config(entry, entry.source)
+
+    assert config.mllm_draft_model is None
+    assert config.mllm_draft_kind is None
+    assert config.mllm_draft_block_size is None
+    assert config.default_mllm_draft is False
+
+
+def test_engine_factory_receives_resolved_mllm_drafter_fields(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4})
+        entry = dataclasses.replace(
+            registry["alpha"],
+            mllm_draft_model="org/draft",
+            mllm_draft_kind="mtp",
+            mllm_draft_block_size=4,
+            default_mllm_draft=True,
+        )
+        created: list[FakeEngine] = []
+
+        def engine_factory(config: ResolvedModelConfig) -> FakeEngine:
+            engine = FakeEngine(config)
+            created.append(engine)
+            return engine
+
+        manager = ModelManager(
+            _manager_config(budget_gb=8),
+            {"alpha": entry},
+            _defaults(),
+            engine_factory=engine_factory,
+        )
+
+        lease = await manager.acquire("alpha")
+        await lease.release()
+
+        [engine] = created
+        config = engine._config
+        assert config.mllm_draft_model == "org/draft"
+        assert config.mllm_draft_kind == "mtp"
+        assert config.mllm_draft_block_size == 4
+        assert config.default_mllm_draft is True
+
+    asyncio.run(_run())
+
+
 def test_acquire_shares_single_inflight_load(tmp_path):
     async def _run():
         registry = _registry(tmp_path, {"alpha": 4})
