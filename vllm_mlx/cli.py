@@ -309,6 +309,13 @@ def serve_command(args):
         server.load_reranker_model(rerank_model, lock=True)
         print(f"Reranker model loaded: {rerank_model}")
 
+    # Pre-load STT model if specified
+    stt_model = getattr(args, "stt_model", None)
+    if stt_model:
+        print(f"Pre-loading STT model: {stt_model}")
+        server.load_stt_model(stt_model, lock=True)
+        print(f"STT model loaded: {stt_model}")
+
     # Build scheduler config for batched mode
     scheduler_config = None
     specprefill_backbone_pct = getattr(args, "specprefill_backbone_pct", 0.0)
@@ -1647,6 +1654,13 @@ Examples:
             "length: 'truncate' (default, observable via a warning + metric) "
             "or 'error' (reject with a structured 400 response)"
         ),
+    )
+    # STT model option
+    serve_parser.add_argument(
+        "--stt-model",
+        type=str,
+        default=None,
+        help="Pre-load an STT model at startup (e.g. CohereLabs/cohere-transcribe-03-2026)",
     )
     # Reranker model option
     serve_parser.add_argument(

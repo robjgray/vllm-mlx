@@ -65,6 +65,25 @@ class TestAudioModelPolicy:
         assert "attacker/unknown-stt" in exc_info.value.detail
         assert "whisper-large-v3" in exc_info.value.detail
 
+    def test_stt_locked_model_can_be_custom(self):
+        assert (
+            resolve_stt_model_name(
+                "custom/private-stt",
+                locked_model="custom/private-stt",
+            )
+            == "custom/private-stt"
+        )
+
+    def test_stt_locked_model_rejects_other_request(self):
+        with pytest.raises(HTTPException) as exc_info:
+            resolve_stt_model_name(
+                "mlx-community/parakeet-tdt-0.6b-v2",
+                locked_model="custom/private-stt",
+            )
+
+        assert exc_info.value.status_code == 400
+        assert "custom/private-stt" in exc_info.value.detail
+
     def test_tts_alias_resolves_to_configured_model(self):
         assert resolve_tts_model_name("kokoro") == "mlx-community/Kokoro-82M-bf16"
 

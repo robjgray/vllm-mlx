@@ -104,8 +104,24 @@ def resolve_embedding_model_name(
     _reject_unknown_embedding_model(requested_model)
 
 
-def resolve_stt_model_name(requested_model: str) -> str:
+def resolve_stt_model_name(
+    requested_model: str,
+    *,
+    locked_model: str | None = None,
+) -> str:
     """Resolve an STT request model alias or configured model ID."""
+    if locked_model is not None:
+        if requested_model == locked_model:
+            return locked_model
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Transcription model '{requested_model}' is not available. "
+                f"This server was started with --stt-model {locked_model}. "
+                f"Only '{locked_model}' can be used for transcriptions. Restart the "
+                f"server with a different --stt-model to use '{requested_model}'."
+            ),
+        )
     if requested_model in _STT_MODEL_MAP:
         return _STT_MODEL_MAP[requested_model]
     _reject_unknown_audio_model("Transcription", requested_model, _STT_MODEL_ALIASES)

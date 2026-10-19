@@ -131,6 +131,18 @@ python examples/audio_separation_example.py examples/rock_get_ready.mp3 \
 - Multilingual: `whisper-large-v3`
 - English only: `parakeet` (3x faster)
 
+### Choosing the STT model
+
+By default, the STT model is loaded on the first `/v1/audio/transcriptions` request, but only from the built-in request-time allowlist above.
+
+To run a different STT model, start the server with `--stt-model`. The endpoint is then locked to that model:
+
+```bash
+vllm-mlx serve my-llm-model --stt-model CohereLabs/cohere-transcribe-03-2026
+```
+
+Requesting a different model at runtime returns HTTP 400. Restart the server with a different `--stt-model` to change it.
+
 ### TTS Models (Text-to-Speech)
 
 #### Kokoro (Fast, Lightweight) - Recommended

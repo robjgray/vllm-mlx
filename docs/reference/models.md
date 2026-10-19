@@ -67,6 +67,8 @@ Browse thousands of pre-optimized models at: **https://huggingface.co/mlx-commun
 | **TTS** | Kokoro | `prince-canuma/Kokoro-82M` |
 | **TTS** | Chatterbox | `chatterbox/chatterbox-tts-0.1` |
 
+STT and TTS request-time model names are allowlisted; use `--stt-model` to pin a different STT model at startup.
+
 ## Model Detection
 
 vllm-mlx auto-detects multimodal models by name patterns:
