@@ -1945,6 +1945,216 @@ class TestMLLMBatchGeneratorMTPGuards:
         assert draft_model.accept_lens == [0]
         assert generator.get_mtp_stats()["rejected"] == 1
 
+    def test_pure_attention_rejection_skips_the_replay_forward(self, monkeypatch):
+        """A rejected draft on a KV-only stack must not re-forward the prefix.
+
+        The cache is rewound in place and the verify forward's primary row is
+        reused, so a rejection costs the same number of model calls as an
+        acceptance instead of an extra full-context pass.
+        """
+        import mlx_vlm.speculative.common as speculative_common
+        import mlx_vlm.speculative.mtp as speculative_mtp
+        from mlx_vlm.models.cache import BatchKVCache
+
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchResponse,
+            install_mtp_mllm,
+        )
+
+        monkeypatch.setattr(
+            speculative_common, "_batch_cache_left_padding", lambda cache: None
+        )
+        monkeypatch.setattr(
+            speculative_mtp,
+            "_mtp_shared_kv_from_prompt_cache",
+            lambda model, cache: {"shared": object()},
+        )
+        monkeypatch.setattr(
+            speculative_mtp,
+            "_mtp_cache_positions",
+            lambda cache, batch_size: (1, [1] * batch_size),
+        )
+        monkeypatch.setattr(
+            speculative_mtp, "_mtp_draft_position", lambda positions: positions
+        )
+        monkeypatch.setattr(
+            speculative_mtp,
+            "_mtp_draft_block_active",
+            lambda *args, **kwargs: mx.array([[2]], dtype=mx.uint32),
+        )
+
+        request = SimpleNamespace(
+            uid=3,
+            request_id="greedy-external",
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            mllm_draft=True,
+            output_tokens=[],
+        )
+        active_batch = SimpleNamespace(
+            uids=[3], requests=[request], num_tokens=[0], max_tokens=[8]
+        )
+        primary_response = MLLMBatchResponse(
+            uid=3, request_id=request.request_id, token=1, logprobs=mx.zeros(4)
+        )
+
+        class Generator:
+            def __init__(self):
+                self.model = object()
+                self.active_batch = active_batch
+                self._step = MagicMock(side_effect=AssertionError("must not bypass"))
+                self._next = MagicMock(return_value=[primary_response])
+                self.sampler = MagicMock()
+                self.stop_tokens = set()
+                self._maybe_store_prefix_cache = MagicMock()
+
+        class DraftModel:
+            def __init__(self):
+                self.accept_lens = []
+                self.draft_lens = []
+
+            def reset(self, model):
+                self.model = model
+
+            def set_shared_kv(self, *args, **kwargs):
+                return None
+
+        class LanguageModel:
+            """Target that appends to the real batch cache like mlx-vlm does."""
+
+            def __init__(self):
+                self.seq_lens = []
+
+            def __call__(self, input_tokens, cache=None, return_hidden=False):
+                seq_len = input_tokens.shape[1]
+                self.seq_lens.append(seq_len)
+                for entry in cache or []:
+                    embeds = mx.zeros((1, 1, seq_len, 4))
+                    entry.update_and_fetch(embeds, embeds)
+                logits = mx.full((1, seq_len, 4), -1000.0)
+                if seq_len == 2:
+                    # Primary row disagrees with the drafted token 2.
+                    logits[:, 0, 3] = 0.0
+                else:
+                    logits[:, -1, 1] = 0.0
+                return logits, mx.zeros((1, seq_len, 2))
+
+        generator = Generator()
+        language_model = LanguageModel()
+        draft_model = DraftModel()
+        cache = [BatchKVCache([0])]
+        install_mtp_mllm(generator, language_model, draft_model=draft_model)
+
+        generator._step(
+            mx.array([[0]], dtype=mx.uint32),
+            cache=cache,
+            logits_processors=None,
+            output_tokens=None,
+            samplers=[lambda logprobs: mx.array([1], dtype=mx.uint32)],
+        )
+
+        # Initial forward + verify only: the reject reuses the verify row.
+        assert language_model.seq_lens == [1, 2]
+        # Verify appended [primary, draft]; the rewind dropped just the draft.
+        assert int(cache[0].offset[0].item()) == 2
+        assert draft_model.accept_lens == [0]
+        assert generator.get_mtp_stats()["rejected"] == 1
+
+    def test_rollback_vetoes_hybrid_recurrent_stacks(self):
+        """Hybrid stacks must keep the snapshot path, not the KV rewind."""
+        from mlx_vlm.models.cache import ArraysCache, BatchKVCache, CacheList
+
+        from vllm_mlx.mllm_batch_generator import (
+            _holds_recurrent_state,
+            _rollback_appended_tokens,
+        )
+
+        recurrent = ArraysCache(1)
+        recurrent.cache = [mx.zeros((1, 4))]
+        kv = BatchKVCache([0])
+        kv.update_and_fetch(mx.zeros((1, 1, 1, 2)), mx.zeros((1, 1, 1, 2)))
+        before = int(kv.offset[0].item())
+
+        assert _holds_recurrent_state(recurrent)
+        assert not _holds_recurrent_state(kv)
+        assert not _rollback_appended_tokens([kv, recurrent], 1)
+        # A veto must not mutate the KV half before the caller falls back.
+        assert int(kv.offset[0].item()) == before
+        assert not _rollback_appended_tokens([CacheList(kv, recurrent)], 1)
+        assert int(kv.offset[0].item()) == before
+
+    @pytest.mark.parametrize("left_padding", [[0, 0], [0, 1]])
+    @pytest.mark.parametrize("window", [None, 8])
+    @pytest.mark.parametrize("prefix", [1, 3, 7, 8, 9, 40])
+    def test_reject_rollback_keeps_attention_cache_exact(
+        self, left_padding, window, prefix
+    ):
+        """A pure-attention rewind must equal never appending the draft.
+
+        The reject path drops the speculative token in place instead of
+        restoring a snapshot and re-forwarding the prefix, so the rewound cache
+        has to attend exactly like one that only ever saw the accepted stream.
+        Row 0 of a width-2 verify is also what a single-token decode would
+        produce, which makes it the reference each step is checked against.
+        Covers the sliding-window wrap and left-padded rows.
+        """
+        from mlx_vlm.models.cache import BatchKVCache, BatchRotatingKVCache
+
+        from vllm_mlx.mllm_batch_generator import _rollback_appended_tokens
+
+        batch, heads, dim = 2, 2, 4
+
+        def make_cache():
+            if window is None:
+                return BatchKVCache(list(left_padding))
+            return BatchRotatingKVCache(window, list(left_padding))
+
+        def attend(cache, keys, values, query):
+            width = keys.shape[2]
+            mask = cache.make_mask(width)
+            key_cache, value_cache = cache.update_and_fetch(keys, values)
+            return mx.fast.scaled_dot_product_attention(
+                query, key_cache, value_cache, scale=0.5, mask=mask
+            )
+
+        mx.random.seed(4)
+        tokens = [mx.random.normal((batch, heads, 1, dim)) for _ in range(128)]
+        query = mx.random.normal((batch, heads, 1, dim))
+        verify_query = mx.concatenate([query, query], axis=2)
+        accept = [index % 3 != 0 for index in range(16)]
+
+        def verify_row(cache, position):
+            pair = mx.concatenate([tokens[position], tokens[position + 1]], axis=2)
+            return attend(cache, pair, pair, verify_query)[:, 0:1]
+
+        cache = make_cache()
+        for index in range(prefix):
+            attend(cache, tokens[index], tokens[index], query)
+        position = prefix
+        for step, accepted in enumerate(accept):
+            # Row 0 of a width-2 verify must match a cache that has only ever
+            # held exactly the accepted stream -- that is the losslessness
+            # claim, and it covers the sliding-window wrap and padding.
+            reference = make_cache()
+            for index in range(position):
+                attend(reference, tokens[index], tokens[index], query)
+            expected = verify_row(reference, position)
+            actual = verify_row(cache, position)
+            assert mx.allclose(expected, actual, atol=1e-4).item(), (
+                f"verify row diverged at step {step} (prefix={prefix}, "
+                f"window={window})"
+            )
+            if accepted:
+                position += 2
+            else:
+                assert _rollback_appended_tokens([cache], 1)
+                position += 1
+        assert position == prefix + sum(1 for a in accept if a) * 2 + sum(
+            1 for a in accept if not a
+        )
+
     def test_uniform_draft_batches_remove_only_selected_requests(self):
         from vllm_mlx.mllm_batch_generator import (
             MLLMBatchGenerator,

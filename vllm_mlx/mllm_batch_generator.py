@@ -2868,6 +2868,116 @@ class MLLMBatchGenerator:
         return bool(self.unprocessed_requests or self.active_batch)
 
 
+def _iter_cache_leaves(caches: List[Any]) -> List[Any]:
+    """Flatten nested ``CacheList`` containers into their leaf caches."""
+    leaves = []
+    stack = list(caches)
+    while stack:
+        c = stack.pop()
+        if c is None:
+            continue
+        children = getattr(c, "caches", None)
+        if children is not None:
+            stack.extend(children)
+        else:
+            leaves.append(c)
+    return leaves
+
+
+def _holds_recurrent_state(cache: Any) -> bool:
+    """Whether a cache leaf keeps state that appended tokens cannot rewind.
+
+    Hybrid stacks (GDN/DeltaNet, Mamba, short convolutions) carry an
+    ``ArraysCache`` per recurrent layer: it has no ``trim`` and its state is a
+    non-linear function of every token it has seen, so a rejected speculative
+    token must be undone by restoring a pre-verify copy and re-forwarding the
+    accepted prefix. Pure-attention leaves expose K/V arrays with a cursor and
+    are rewound in place instead.
+    """
+    children = getattr(cache, "caches", None)
+    if children is not None:
+        return any(_holds_recurrent_state(child) for child in children)
+    return getattr(cache, "keys", None) is None or not callable(
+        getattr(cache, "trim", None)
+    )
+
+
+def _rollback_appended_tokens(caches: List[Any], count: int) -> bool:
+    """Drop ``count`` previously appended tokens from KV-only caches.
+
+    Leaves the cache holding exactly the accepted prefix at the accepted
+    positions, which is what the reject path needs before it can reuse the
+    verified primary row -- no second full-context forward required. Two
+    layouts need different handling:
+
+    * append-only ``BatchKVCache``/``QuantizedKVCache`` write at a cursor and
+      expose the live prefix, so decrementing the cursor via ``trim`` is
+      exact and O(1).
+    * ``BatchRotatingKVCache`` reports ``is_trimmable() == False`` once its
+      window wraps, and a plain ``trim`` there only moves cursors while
+      leaving the rejected columns past ``_idx``; the next temporal reorder
+      would then resurrect them as phantom keys. Its newest entries are
+      contiguous in the physical ring, so the rejected columns are spliced
+      out instead. The window is bounded by ``max_size``, keeping the copy
+      cheap.
+
+    Validation runs before any mutation so a cache stack is either rewound
+    whole or left untouched for the caller's snapshot fallback.
+    """
+    leaves = _iter_cache_leaves(caches)
+    plans = []
+    for cache in leaves:
+        if _holds_recurrent_state(cache):
+            return False
+        keys = getattr(cache, "keys", None)
+        if keys is None or not callable(getattr(cache, "trim", None)):
+            return False
+        if hasattr(cache, "rotated") and hasattr(cache, "max_size"):
+            # Sliding-window ring: ``trim`` only moves cursors and leaves the
+            # rejected columns behind ``_idx``, where the next temporal
+            # reorder would revive them.
+            if keys.shape[2] < count or getattr(cache, "_idx", 0) < count:
+                return False
+            plans.append((cache, True))
+        else:
+            offset = getattr(cache, "offset", 0)
+            if isinstance(offset, mx.array):
+                # Every row must retain the prefix for a batch-wide rewind to
+                # stay row-aligned.
+                if offset.size == 0 or int(offset.min()) < count:
+                    return False
+            elif offset < count:
+                return False
+            plans.append((cache, False))
+
+    for cache, rotating in plans:
+        if not rotating:
+            if cache.trim(count) != count:
+                raise RuntimeError(
+                    "Speculative rollback trimmed fewer tokens than requested"
+                )
+            continue
+        # The newest entries are contiguous at ``[..., _idx - count : _idx]``
+        # of the physical ring (or at the tail before the first wrap), and
+        # ``trim`` advances none of the three cursors for them.
+        idx = cache._idx
+        for name in ("keys", "values"):
+            buf = getattr(cache, name)
+            tail = buf[..., idx:, :]
+            kept = buf[..., : idx - count, :]
+            setattr(
+                cache,
+                name,
+                mx.contiguous(
+                    kept if tail.shape[2] == 0 else mx.concatenate([kept, tail], axis=2)
+                ),
+            )
+        cache._idx -= count
+        cache._offset -= count
+        cache.offset -= count
+    return True
+
+
 def _draft_external_mtp_active_batch(
     draft_model: Any,
     primary_tokens: mx.array,
@@ -3190,14 +3300,16 @@ def install_mtp_mllm(
                 # as a count so future multi-token drafters can report >1.
                 _attempted_drafts_by_uid[uid] = 1
 
-            # Snapshot RNN state for hybrid models
+            # Snapshot only genuinely recurrent state. Pure-attention stacks
+            # (gemma-4: KVCache + RotatingKVCache) are rewound in place on
+            # reject, so copying their K/V every step would pin a full lazy
+            # graph for nothing.
             _rnn_snapshots = {}
             for _ci, _c in enumerate(cache):
-                if not (hasattr(_c, "is_trimmable") and _c.is_trimmable()):
-                    if hasattr(_c, "state"):
-                        _rnn_snapshots[_ci] = [
-                            mx.array(s) if s is not None else None for s in _c.state
-                        ]
+                if _holds_recurrent_state(_c) and hasattr(_c, "state"):
+                    _rnn_snapshots[_ci] = [
+                        mx.array(s) if s is not None else None for s in _c.state
+                    ]
 
             # Verify [primary, draft]
             verify_input = mx.concatenate(
@@ -3211,10 +3323,11 @@ def install_mtp_mllm(
             # Verify in each request's sampler space. The old argmax equality
             # check was valid only for greedy decoding and silently bypassed
             # Qwen's normal temperature/top-p/top-k requests.
-            draft_list = draft_tokens.tolist()
+            draft_list: Optional[List[int]] = None
             residual_tokens_by_uid: Dict[int, int] = {}
             residual_logprobs_by_uid: Dict[int, mx.array] = {}
             if uses_stochastic_sampling and external_drafter:
+                draft_list = draft_tokens.tolist()
                 verify_distribution = mx.concatenate(
                     [
                         _sampling_logprobs(verify_logits[row : row + 1, 0, :], request)
@@ -3234,6 +3347,7 @@ def install_mtp_mllm(
                         residual_tokens_by_uid[uid] = int(sampled_target_list[row])
                         residual_logprobs_by_uid[uid] = verify_distribution[row]
             elif uses_stochastic_sampling:
+                draft_list = draft_tokens.tolist()
                 verify_distribution = mx.concatenate(
                     [
                         _sampling_logprobs(verify_logits[row : row + 1, 0, :], request)
@@ -3262,9 +3376,13 @@ def install_mtp_mllm(
                         residual_tokens_by_uid[uid] = int(residual_token.item())
                         residual_logprobs_by_uid[uid] = residual[0]
             else:
+                # One host round-trip for the whole accept decision: building
+                # both token lists and comparing them in Python cost two, and
+                # every draft acceptance on a greedy request hits this line.
                 verify_pred = mx.argmax(verify_logits[:, 0, :], axis=-1)
-                mx.eval(verify_pred, draft_tokens)
-                all_accepted = verify_pred.tolist() == draft_list
+                accepted_rows = (verify_pred == draft_tokens.reshape(-1)).tolist()
+                all_accepted = all(accepted_rows)
+                draft_list = draft_tokens.tolist()
 
             if all_accepted and verify_hidden is not None:
                 # ACCEPT
@@ -3336,6 +3454,49 @@ def install_mtp_mllm(
                             _skip_state_by_uid[uid] = {
                                 "logits": rerun_logits[row : row + 1, -1, :],
                                 "hidden": rerun_hidden[row : row + 1, -1:, :],
+                            }
+                    else:
+                        _skip_state_by_uid.clear()
+                elif _rollback_appended_tokens(cache, 1):
+                    # Pure-attention stack: rewinding the rejected draft leaves
+                    # the cache exactly at the verified primary token. A sampled
+                    # residual (the request's own draw) still has to be advanced
+                    # so its successor distribution exists; without one, the
+                    # verify forward's row 0 logits/hidden already are that
+                    # distribution, so no second full-context forward is needed.
+                    if sampled_reject:
+                        residual_tokens = mx.array(
+                            [residual_tokens_by_uid[uid] for uid in current_uids]
+                        )
+                        rerun_out = language_model(
+                            residual_tokens[:, None],
+                            cache=cache,
+                            return_hidden=True,
+                            **model_kwargs,
+                        )
+                        if isinstance(rerun_out, tuple) or hasattr(rerun_out, "logits"):
+                            rerun_logits, rerun_hidden = _model_parts(rerun_out)
+                            # language_model(...) returns (batch, seq, vocab)/
+                            # (batch, seq, hidden); reduce logits to the same
+                            # 2-D (batch, vocab) convention every other
+                            # _skip_state_by_uid write in this function uses.
+                            rerun_logits = rerun_logits[:, -1, :]
+                            rerun_hidden = rerun_hidden[:, -1:, :]
+                        else:
+                            rerun_logits, rerun_hidden = rerun_out[:, -1, :], None
+                    else:
+                        rerun_logits, rerun_hidden = verify_logits[:, 0, :], (
+                            verify_hidden[:, 0:1, :]
+                            if verify_hidden is not None
+                            else None
+                        )
+
+                    if rerun_hidden is not None:
+                        mx.async_eval(rerun_logits, rerun_hidden)
+                        for row, uid in enumerate(current_uids):
+                            _skip_state_by_uid[uid] = {
+                                "logits": rerun_logits[row : row + 1],
+                                "hidden": rerun_hidden[row : row + 1],
                             }
                     else:
                         _skip_state_by_uid.clear()
