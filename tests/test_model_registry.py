@@ -417,6 +417,359 @@ def test_engine_factory_receives_resolved_mllm_drafter_fields(tmp_path):
     asyncio.run(_run())
 
 
+def test_registry_loads_parser_fields(tmp_path):
+    config_path = tmp_path / "models.yaml"
+    config_path.write_text("""
+manager:
+  memory_budget_gb: 8
+models:
+  - name: alpha
+    path: /tmp/alpha
+    reasoning_parser: muse_glimmer
+    tool_call_parser: muse_glimmer
+    enable_auto_tool_choice: true
+    cache_memory_mb: 16348
+""")
+
+    _, registry = load_registry_config(config_path, _defaults())
+
+    entry = registry["alpha"]
+    assert entry.reasoning_parser == "muse_glimmer"
+    assert entry.tool_call_parser == "muse_glimmer"
+    assert entry.enable_auto_tool_choice is True
+    assert entry.cache_memory_mb == 16348
+
+
+def test_registry_rejects_empty_parser_name(tmp_path):
+    for field in ("reasoning_parser", "tool_call_parser"):
+        config_path = tmp_path / f"models_{field}.yaml"
+        config_path.write_text(f"""
+manager:
+  memory_budget_gb: 8
+models:
+  - name: alpha
+    path: /tmp/alpha
+    {field}: ""
+""")
+
+        with pytest.raises(
+            ValueError, match=f"{field} must be a non-empty string"
+        ):
+            load_registry_config(config_path, _defaults())
+
+
+def test_registry_rejects_auto_tool_choice_without_tool_parser(tmp_path):
+    config_path = tmp_path / "models.yaml"
+    config_path.write_text("""
+manager:
+  memory_budget_gb: 8
+models:
+  - name: alpha
+    path: /tmp/alpha
+    enable_auto_tool_choice: true
+""")
+
+    with pytest.raises(
+        ValueError, match="enable_auto_tool_choice requires tool_call_parser"
+    ):
+        load_registry_config(config_path, _defaults())
+
+
+def test_registry_rejects_non_boolean_auto_tool_choice(tmp_path):
+    config_path = tmp_path / "models.yaml"
+    config_path.write_text("""
+manager:
+  memory_budget_gb: 8
+models:
+  - name: alpha
+    path: /tmp/alpha
+    enable_auto_tool_choice: "true"
+""")
+
+    with pytest.raises(ValueError, match="enable_auto_tool_choice must be a boolean"):
+        load_registry_config(config_path, _defaults())
+
+
+@pytest.mark.parametrize("raw_value", ["0", "-4", "not-a-number"])
+def test_registry_rejects_invalid_cache_memory_mb(tmp_path, raw_value):
+    config_path = tmp_path / "models.yaml"
+    config_path.write_text(f"""
+manager:
+  memory_budget_gb: 8
+models:
+  - name: alpha
+    path: /tmp/alpha
+    cache_memory_mb: {raw_value}
+""")
+
+    with pytest.raises(
+        ValueError, match="cache_memory_mb must be a positive integer"
+    ):
+        load_registry_config(config_path, _defaults())
+
+
+def test_resolve_model_config_coerces_parser_fields(tmp_path):
+    registry = _registry(tmp_path, {"alpha": 4})
+    entry = dataclasses.replace(
+        registry["alpha"],
+        reasoning_parser="muse_glimmer",
+        tool_call_parser="muse_glimmer",
+        enable_auto_tool_choice=True,
+        cache_memory_mb=16348,
+    )
+    manager = ModelManager(
+        _manager_config(budget_gb=8),
+        {"alpha": entry},
+        _defaults(),
+        engine_factory=lambda config: FakeEngine(config),
+    )
+
+    config = manager._resolve_model_config(entry, entry.source)
+
+    assert config.reasoning_parser == "muse_glimmer"
+    assert config.tool_call_parser == "muse_glimmer"
+    assert config.enable_auto_tool_choice is True
+    assert config.cache_memory_mb == 16348
+    assert config.scheduler_config is None or (
+        config.scheduler_config.cache_memory_mb == 16348
+    )
+
+
+def test_resolve_model_config_defaults_parser_fields(tmp_path):
+    registry = _registry(tmp_path, {"alpha": 4})
+    entry = registry["alpha"]
+    defaults = dataclasses.replace(
+        _defaults(),
+        reasoning_parser="qwen3",
+        tool_call_parser="qwen3_xml",
+        enable_auto_tool_choice=True,
+    )
+    manager = ModelManager(
+        _manager_config(budget_gb=8),
+        registry,
+        defaults,
+        engine_factory=lambda config: FakeEngine(config),
+    )
+
+    config = manager._resolve_model_config(entry, entry.source)
+
+    assert config.reasoning_parser == "qwen3"
+    assert config.tool_call_parser == "qwen3_xml"
+    assert config.enable_auto_tool_choice is True
+    assert config.cache_memory_mb is None
+
+
+def test_resolve_model_config_applies_entry_cache_memory_mb_to_clone():
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    defaults = dataclasses.replace(
+        _defaults(), scheduler_config=SchedulerConfig(cache_memory_mb=8192)
+    )
+    registry = {
+        "alpha": RegisteredModel(
+            name="alpha",
+            source="/tmp/alpha",
+            continuous_batching=True,
+            cache_memory_mb=16348,
+            estimated_memory_bytes=4 * (1024**3),
+        )
+    }
+    manager = ModelManager(
+        _manager_config(budget_gb=8),
+        registry,
+        defaults,
+        engine_factory=lambda config: FakeEngine(config),
+    )
+
+    config = manager._resolve_model_config(registry["alpha"], "/tmp/alpha")
+
+    assert config.scheduler_config is not None
+    assert config.scheduler_config.cache_memory_mb == 16348
+    # The global scheduler config must stay untouched.
+    assert defaults.scheduler_config.cache_memory_mb == 8192
+    assert config.cache_memory_mb == 16348
+
+
+def test_resolve_model_config_builds_scheduler_for_batched_entry_without_global():
+    """CLI serves no scheduler flags: a batched entry still gets its own config."""
+    registry = {
+        "alpha": RegisteredModel(
+            name="alpha",
+            source="/tmp/alpha",
+            continuous_batching=True,
+            cache_memory_mb=512,
+            prefill_step_size=1024,
+            estimated_memory_bytes=4 * (1024**3),
+        )
+    }
+    manager = ModelManager(
+        _manager_config(budget_gb=8),
+        registry,
+        _defaults(),  # scheduler_config=None, like vexillm's registry serve
+        engine_factory=lambda config: FakeEngine(config),
+    )
+
+    config = manager._resolve_model_config(registry["alpha"], "/tmp/alpha")
+
+    # Without this, BatchedEngine builds its own default SchedulerConfig and
+    # silently drops the per-entry cache/prefill overrides.
+    assert config.scheduler_config is not None
+    assert config.scheduler_config.cache_memory_mb == 512
+    assert config.scheduler_config.prefill_step_size == 1024
+    assert config.cache_memory_mb == 512
+
+
+def test_engine_factory_receives_parser_fields(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4})
+        entry = dataclasses.replace(
+            registry["alpha"],
+            reasoning_parser="muse_glimmer",
+            tool_call_parser="muse_glimmer",
+            enable_auto_tool_choice=True,
+        )
+        created: list[FakeEngine] = []
+
+        def engine_factory(config: ResolvedModelConfig) -> FakeEngine:
+            engine = FakeEngine(config)
+            created.append(engine)
+            return engine
+
+        manager = ModelManager(
+            _manager_config(budget_gb=8),
+            {"alpha": entry},
+            _defaults(),
+            engine_factory=engine_factory,
+        )
+
+        lease = await manager.acquire("alpha")
+        await lease.release()
+
+        [engine] = created
+        config = engine._config
+        assert config.reasoning_parser == "muse_glimmer"
+        assert config.tool_call_parser == "muse_glimmer"
+        assert config.enable_auto_tool_choice is True
+
+    asyncio.run(_run())
+
+
+def test_request_context_resolves_parsers_from_engine():
+    """Server parser resolution prefers engine per-entry fields over globals."""
+    from vllm_mlx.engine.base import BaseEngine
+    from vllm_mlx import server
+
+    class _GlimmerEngine(BaseEngine):
+        def __init__(self):
+            self.reasoning_parser_name = "muse_glimmer"
+            self.tool_call_parser_name = "muse_glimmer"
+            self.auto_tool_choice = True
+
+        @property
+        def model_name(self) -> str:
+            return "glimmer"
+
+        @property
+        def is_mllm(self) -> bool:
+            return False
+
+        @property
+        def tokenizer(self):
+            return None
+
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
+        async def generate(self, *args, **kwargs):
+            raise NotImplementedError
+
+        async def stream_generate(self, *args, **kwargs):
+            raise NotImplementedError
+
+        async def chat(self, *args, **kwargs):
+            raise NotImplementedError
+
+        async def stream_chat(self, *args, **kwargs):
+            raise NotImplementedError
+
+    engine = _GlimmerEngine()
+
+    # Globals unset: the engine fields alone drive resolution.
+    saved = (server._reasoning_parser_name, server._reasoning_parser,
+             server._tool_call_parser, server._enable_auto_tool_choice)
+    server._reasoning_parser_name = None
+    server._reasoning_parser = None
+    server._tool_call_parser = None
+    server._enable_auto_tool_choice = False
+    try:
+        assert server._effective_reasoning_parser_name(engine) == "muse_glimmer"
+        assert server._effective_tool_config(engine) == ("muse_glimmer", True)
+        parser = server._build_reasoning_parser(engine)
+        assert type(parser).__name__ == "MuseGlimmerReasoningParser"
+        tool_parser = server._build_tool_parser(engine)
+        assert type(tool_parser).__name__ == "MuseGlimmerToolParser"
+        assert server._detect_native_tool_support(engine) is True
+    finally:
+        (server._reasoning_parser_name, server._reasoning_parser,
+         server._tool_call_parser, server._enable_auto_tool_choice) = saved
+
+
+def test_effective_tool_config_falls_back_to_globals():
+    from vllm_mlx import server
+
+    saved = (server._tool_call_parser, server._enable_auto_tool_choice)
+    server._tool_call_parser = "qwen3_xml"
+    server._enable_auto_tool_choice = True
+    try:
+        # No engine: CLI flags rule, matching single-model behavior byte-for-byte.
+        assert server._effective_tool_config(None) == ("qwen3_xml", True)
+        assert server._effective_reasoning_parser_name(None) is None
+    finally:
+        (server._tool_call_parser, server._enable_auto_tool_choice) = saved
+
+
+def test_budget_report_uses_max_per_entry_cache_memory_mb():
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    defaults = dataclasses.replace(
+        _defaults(),
+        continuous_batching=True,
+        scheduler_config=SchedulerConfig(
+            enable_prefix_cache=True,
+            use_memory_aware_cache=True,
+            cache_memory_mb=8192,
+        ),
+    )
+    registry = {
+        "small": RegisteredModel(
+            name="small",
+            source="/tmp/small",
+            continuous_batching=True,
+            cache_memory_mb=4096,
+        ),
+        "large": RegisteredModel(
+            name="large",
+            source="/tmp/large",
+            continuous_batching=True,
+            cache_memory_mb=16348,
+        ),
+        "global": RegisteredModel(
+            name="global",
+            source="/tmp/global",
+            continuous_batching=True,
+        ),
+    }
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=8), registry, defaults
+    )
+
+    assert report.per_engine_cache_limit_bytes == 16348 * (1024**2)
+    assert report.memory_aware_prefix_cache_entries == 3
+
 def test_acquire_shares_single_inflight_load(tmp_path):
     async def _run():
         registry = _registry(tmp_path, {"alpha": 4})

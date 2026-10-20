@@ -257,6 +257,10 @@ Optional:
 - `mllm_draft_kind`: optional mlx-vlm draft kind, for example `mtp`
 - `mllm_draft_block_size`: optional speculative block size for mlx-vlm (must be a positive integer)
 - `default_mllm_draft`: enable the configured assistant drafter unless a request explicitly opts out
+- `reasoning_parser`: per-entry reasoning parser (e.g. `muse_glimmer`, `gemma4`, `qwen3`); resolved per request from the entry, with `--reasoning-parser` as the fallback default
+- `tool_call_parser`: per-entry tool call parser; resolved per request from the entry, with `--tool-call-parser` as the fallback default
+- `enable_auto_tool_choice`: enable auto tool choice for this entry (requires `tool_call_parser`); resolved per request
+- `cache_memory_mb`: override the scheduler's prefix-cache memory cap for this entry's engine (must be a positive integer; applies only to continuous-batching entries)
 - `stream_interval`
 - `gpu_memory_utilization`
 - `estimated_memory_gb`

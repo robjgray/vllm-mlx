@@ -887,7 +887,10 @@ def _prepare_chat_completion_invocation(
         response_format,
         tools=request.tools,
         tool_choice=request.tool_choice,
-        thinking_model=bool(_reasoning_parser),
+        thinking_model=(
+            _effective_reasoning_parser_name(engine) is not None
+            or _reasoning_parser is not None
+        ),
     )
 
     chat_kwargs = {
@@ -939,8 +942,10 @@ def _prepare_chat_completion_invocation(
         )
         chat_kwargs["tools"] = template_tools
 
-    parser_name = _tool_call_parser if _enable_auto_tool_choice else None
-    merged_stop = get_parser_stop_tokens(parser_name, request.stop)
+    parser_name, tool_choice_on = _effective_tool_config(engine)
+    merged_stop = get_parser_stop_tokens(
+        parser_name if tool_choice_on else None, request.stop
+    )
     if merged_stop:
         chat_kwargs["stop"] = merged_stop
 
@@ -998,7 +1003,10 @@ def _prepare_anthropic_invocation(
         tools=openai_request.tools,
         tool_choice=openai_request.tool_choice,
         log_context="Anthropic",
-        thinking_model=bool(_reasoning_parser),
+        thinking_model=(
+            _effective_reasoning_parser_name(engine) is not None
+            or _reasoning_parser is not None
+        ),
     )
 
     chat_kwargs = {
@@ -1061,6 +1069,41 @@ _auth_warning_logged: bool = False
 # Reasoning parser (for models like Qwen3, DeepSeek-R1)
 _reasoning_parser = None  # ReasoningParser instance when enabled
 _reasoning_parser_name: str | None = None
+
+_ENG_REASONING_PARSER_ATTR = "reasoning_parser_name"
+_ENG_TOOL_PARSER_ATTR = "tool_call_parser_name"
+_ENG_AUTO_TOOL_CHOICE_ATTR = "auto_tool_choice"
+
+
+def _effective_reasoning_parser_name(engine: BaseEngine | None) -> str | None:
+    """Per-entry parser name when the engine carries one, else the CLI default."""
+    override = getattr(engine, _ENG_REASONING_PARSER_ATTR, None)
+    if isinstance(override, str) and override:
+        return override
+    return _reasoning_parser_name
+
+
+def _effective_tool_config(
+    engine: BaseEngine | None,
+) -> tuple[str | None, bool]:
+    """Resolve (tool parser name, auto tool choice) for the request's engine.
+
+    Registry entries can override both fields per engine; the CLI flags remain
+    the fallback default for single-model serving and for engines constructed
+    without the override (e.g. lifecycle residency). Only string/bool-typed
+    overrides count; anything else (an unset attribute on a test double) falls
+    back to the CLI configuration.
+    """
+    override = getattr(engine, _ENG_TOOL_PARSER_ATTR, None)
+    parser_name = override if isinstance(override, str) and override else None
+    enabled = (
+        getattr(engine, _ENG_AUTO_TOOL_CHOICE_ATTR, False) is True
+    ) or _enable_auto_tool_choice
+    if not parser_name:
+        parser_name = _tool_call_parser
+    if not parser_name or not enabled:
+        return None, False
+    return parser_name, True
 
 
 def _thinking_disabled(request, chat_kwargs: dict | None = None) -> bool:
@@ -1275,8 +1318,8 @@ async def _acquire_request_model(request_model: str) -> RequestModelContext:
 
     if _model_manager is None:
         engine = get_engine()
-        engine.preserve_native_tool_format = _detect_native_tool_support()
-        engine.use_harmony_rendering = _detect_harmony_rendering()
+        engine.preserve_native_tool_format = _detect_native_tool_support(engine)
+        engine.use_harmony_rendering = _detect_harmony_rendering(engine)
         return RequestModelContext(
             model_name=_model_name or request_model, engine=engine
         )
@@ -1286,9 +1329,11 @@ async def _acquire_request_model(request_model: str) -> RequestModelContext:
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    lease.engine.preserve_native_tool_format = _detect_native_tool_support()
+    lease.engine.preserve_native_tool_format = _detect_native_tool_support(
+        lease.engine
+    )
 
-    lease.engine.use_harmony_rendering = _detect_harmony_rendering()
+    lease.engine.use_harmony_rendering = _detect_harmony_rendering(lease.engine)
     return RequestModelContext(
         model_name=request_model,
         engine=lease.engine,
@@ -1298,13 +1343,18 @@ async def _acquire_request_model(request_model: str) -> RequestModelContext:
 
 def _build_tool_parser(engine: BaseEngine | None):
     """Create a fresh tool parser instance for a single request/stream."""
-    if not _enable_auto_tool_choice or not _tool_call_parser:
+    parser_name, enabled = _effective_tool_config(engine)
+    if not enabled or not parser_name:
         return None
 
+    # Reuse the CLI-initialized instance only when the engine has no per-entry
+    # override; a per-entry parser must be a different class.
+    override = getattr(engine, _ENG_TOOL_PARSER_ATTR, None)
     parser_cls = (
         type(_tool_parser_instance)
         if _tool_parser_instance is not None
-        else ToolParserManager.get_tool_parser(_tool_call_parser)
+        and not (isinstance(override, str) and override)
+        else ToolParserManager.get_tool_parser(parser_name)
     )
     tokenizer = _get_engine_tokenizer(engine if engine is not None else _engine)
     try:
@@ -1316,8 +1366,9 @@ def _build_tool_parser(engine: BaseEngine | None):
 def _build_reasoning_parser(engine: BaseEngine | None = None):
     """Create a fresh reasoning parser instance for a single request/stream."""
     tokenizer = getattr(engine, "tokenizer", None) if engine is not None else None
-    if _reasoning_parser_name is not None:
-        parser_cls = get_reasoning_parser(_reasoning_parser_name)
+    parser_name = _effective_reasoning_parser_name(engine)
+    if parser_name is not None:
+        parser_cls = get_reasoning_parser(parser_name)
         try:
             return parser_cls(tokenizer)
         except TypeError:
@@ -1750,8 +1801,8 @@ def _activate_engine(engine: BaseEngine | None) -> BaseEngine | None:
         _invalidate_tool_parser_cache("resident engine changed")
     _engine = engine
     if _engine is not None:
-        _engine.preserve_native_tool_format = _detect_native_tool_support()
-        _engine.use_harmony_rendering = _detect_harmony_rendering()
+        _engine.preserve_native_tool_format = _detect_native_tool_support(_engine)
+        _engine.use_harmony_rendering = _detect_harmony_rendering(_engine)
     return _engine
 
 
@@ -2426,9 +2477,31 @@ def _tool_names_from_request_tools(tools) -> list[str]:
     return names
 
 
-def _validate_muse_glimmer_tool_names(tools) -> None:
+def _registry_entry_tool_parser(model_name: str | None) -> str | None:
+    """Return the registry entry's tool parser override, if any.
+
+    Muse Glimmer name validation runs before any engine is acquired, so the
+    per-entry parser must be read from the registry entry itself.
+    """
+    if _model_manager is None or not model_name:
+        return None
+    registry = getattr(_model_manager, "_registry", None)
+    if not registry:
+        return None
+    entry = registry.get(model_name)
+    return getattr(entry, "tool_call_parser", None) if entry is not None else None
+
+
+def _effective_tool_parser_for_model(model_name: str | None) -> str | None:
+    """Effective tool parser for a request model: entry override else CLI flag."""
+    return _registry_entry_tool_parser(model_name) or _tool_call_parser
+
+
+def _validate_muse_glimmer_tool_names(
+    tools, request_model: str | None = None
+) -> None:
     """Reject tool names that collide with Muse Glimmer's reserved recipients."""
-    if _tool_call_parser != "muse_glimmer":
+    if _effective_tool_parser_for_model(request_model) != "muse_glimmer":
         return
     collisions = sorted(
         set(_tool_names_from_request_tools(tools)) & _MUSE_GLIMMER_RESERVED_TOOL_NAMES
@@ -2454,15 +2527,31 @@ def _get_engine_tokenizer(engine: BaseEngine | None) -> object | None:
     return getattr(engine, "_tokenizer", None)
 
 
-def _get_or_init_tool_parser(engine: BaseEngine | None = None):
-    """Return the cached tool parser, initializing it from the given engine."""
+def _get_or_init_tool_parser(
+    engine: BaseEngine | None = None, parser_name: str | None = None
+):
+    """Return the cached tool parser, initializing it from the given engine.
+
+    The cache holds only the CLI-configured parser; a per-entry parser from a
+    registry entry is built fresh per call (its tokenizer is engine-local).
+    """
     global _tool_parser_instance
 
+    name = parser_name or _tool_call_parser
+    override = getattr(engine, _ENG_TOOL_PARSER_ATTR, None)
+    if isinstance(override, str) and override:
+        parser_cls = ToolParserManager.get_tool_parser(override)
+        tokenizer = _get_engine_tokenizer(engine)
+        try:
+            return parser_cls(tokenizer)
+        except TypeError:
+            return parser_cls()
+
     if _tool_parser_instance is None:
-        parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
+        parser_cls = ToolParserManager.get_tool_parser(name)
         tokenizer = _get_engine_tokenizer(engine if engine is not None else _engine)
         _tool_parser_instance = parser_cls(tokenizer)
-        logger.info(f"Initialized tool call parser: {_tool_call_parser}")
+        logger.info(f"Initialized tool call parser: {name}")
 
     return _tool_parser_instance
 
@@ -2475,8 +2564,9 @@ def _parse_tool_calls_with_parser(
     """
     Parse tool calls from model output using the configured parser.
 
-    If --enable-auto-tool-choice is set with --tool-call-parser, uses the
-    selected parser. Otherwise falls back to the generic parse_tool_calls.
+    If auto tool choice is enabled — via the CLI flags or the request engine's
+    registry entry — uses the selected parser. Otherwise falls back to the
+    generic parse_tool_calls.
 
     Args:
         output_text: The model output text
@@ -2486,8 +2576,6 @@ def _parse_tool_calls_with_parser(
     Returns:
         Tuple of (cleaned_text, tool_calls)
     """
-    global _tool_parser_instance
-
     request_dict = request.model_dump() if request else None
 
     # Tool parsing is valid only when the request declares available tools.
@@ -2503,27 +2591,18 @@ def _parse_tool_calls_with_parser(
             return output_text, None
 
     # If auto tool choice is not enabled, use the generic parser
-    if not _enable_auto_tool_choice or not _tool_call_parser:
+    parser_name, enabled = _effective_tool_config(engine)
+    if not enabled or not parser_name:
         return parse_tool_calls(output_text, request_dict)
 
     # Initialize parser if needed
-    if _tool_parser_instance is None:
-        try:
-            _get_or_init_tool_parser(engine)
-        except Exception as e:
-            logger.warning(
-                "Failed to initialize tool parser '%s': %s",
-                _tool_call_parser,
-                _sanitize_log_text(e, limit=500),
-            )
-            logger.warning("Falling back to generic parser")
-            return parse_tool_calls(output_text, request_dict)
+    tool_parser_instance = _get_or_init_tool_parser(engine, parser_name)
 
     # Use the configured parser
     try:
         # Reset parser state between requests
-        _tool_parser_instance.reset()
-        result = _tool_parser_instance.extract_tool_calls(output_text, request_dict)
+        tool_parser_instance.reset()
+        result = tool_parser_instance.extract_tool_calls(output_text, request_dict)
         if result.tools_called:
             tools = request_dict.get("tools") if request_dict else None
             tool_calls = [
@@ -3004,7 +3083,7 @@ def _prepare_responses_request(
 ) -> tuple[BaseEngine, ChatCompletionRequest, list[dict], dict]:
     """Prepare a Responses request for execution on the chat engine."""
     _validate_model_name(request.model)
-    _validate_muse_glimmer_tool_names(request.tools)
+    _validate_muse_glimmer_tool_names(request.tools, request.model)
     engine = get_engine()
     chat_request = _responses_request_to_chat_request(request)
 
@@ -3069,10 +3148,13 @@ async def _run_responses_request(
         return None, []
     _raise_if_generation_error(output)
 
-    cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, chat_request)
+    cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+        output.text, chat_request, engine=engine
+    )
     reasoning_text = None
-    if _reasoning_parser:
-        reasoning_text, remaining_text = _reasoning_parser.extract_reasoning(
+    reasoning_parser = _build_reasoning_parser(engine)
+    if reasoning_parser:
+        reasoning_text, remaining_text = reasoning_parser.extract_reasoning(
             output.text
         )
         if not tool_calls:
@@ -3081,7 +3163,7 @@ async def _run_responses_request(
             # Tool parser already stripped tool markup from cleaned_text,
             # but reasoning markers (e.g. <|channel>thought...<channel|>)
             # remain. Run reasoning parser on cleaned_text to strip them.
-            _, cleaned_text = _reasoning_parser.extract_reasoning(cleaned_text or "")
+            _, cleaned_text = reasoning_parser.extract_reasoning(cleaned_text or "")
 
     output_items = _build_responses_output_items(
         clean_output_text(cleaned_text) if cleaned_text else None,
@@ -3417,7 +3499,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
         sequence += 1
 
     cleaned_text, tool_calls = _parse_tool_calls_with_parser(
-        raw_accumulated_text, chat_request
+        raw_accumulated_text, chat_request, engine=engine
     )
     final_text = accumulated_text
     if cleaned_text is not None and not final_text and not tool_calls:
@@ -3648,15 +3730,19 @@ def _extract_reasoning_and_tool_calls(
     reasoning_text = None
     text_for_tool_parse = output_text
 
+    # Registry entries carry their own reasoning parser; build it from the
+    # request's engine so the per-entry parser strips this model's markers.
+    reasoning_parser = _build_reasoning_parser(engine)
+
     suppress_reasoning = not allow_reasoning
-    if _reasoning_parser and suppress_reasoning:
+    if reasoning_parser and suppress_reasoning:
         # Thinking is disabled, but the model opened an explicit reasoning
         # block anyway — parse iff markers are present (see
         # _explicit_reasoning_markers_present).
         allow_reasoning = _explicit_reasoning_markers_present(output_text)
 
-    if _reasoning_parser and allow_reasoning:
-        reasoning_text, cleaned_reasoning_text = _reasoning_parser.extract_reasoning(
+    if reasoning_parser and allow_reasoning:
+        reasoning_text, cleaned_reasoning_text = reasoning_parser.extract_reasoning(
             output_text
         )
         if cleaned_reasoning_text is not None:
@@ -3699,26 +3785,31 @@ def _extract_reasoning_and_tool_calls(
     return reasoning_text, cleaned_text, tool_calls
 
 
-def _detect_native_tool_support() -> bool:
+def _detect_native_tool_support(engine: BaseEngine | None = None) -> bool:
     """
     Detect if the active tool parser supports native tool format.
 
     Native format means role="tool" messages and tool_calls fields
     are preserved instead of being converted to text.
 
+    Args:
+        engine: The request's engine; registry entries can carry a per-entry
+            tool parser that overrides the CLI default.
+
     Returns:
         True if native format should be preserved
     """
-    if not _enable_auto_tool_choice or not _tool_call_parser:
+    parser_name, enabled = _effective_tool_config(engine)
+    if not enabled or not parser_name:
         return False
 
     try:
-        parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
+        parser_cls = ToolParserManager.get_tool_parser(parser_name)
         return parser_cls.supports_native_format()
     except KeyError:
         # Parser not found - this is a configuration error, log as error
         logger.error(
-            f"Tool parser '{_tool_call_parser}' not found. "
+            f"Tool parser '{parser_name}' not found. "
             f"Available parsers: {ToolParserManager.list_registered()}"
         )
         return False
@@ -3731,12 +3822,13 @@ def _detect_native_tool_support() -> bool:
         return False
 
 
-def _detect_harmony_rendering() -> bool:
+def _detect_harmony_rendering(engine: BaseEngine | None = None) -> bool:
     """Detect whether the harmony rendering path should handle prompt building.
 
     Returns True when ALL of:
-    - ``--tool-call-parser`` is set to ``harmony`` or ``gpt-oss``
-    - ``--enable-auto-tool-choice`` is on
+    - the effective tool parser (per-entry override or ``--tool-call-parser``)
+      is set to ``harmony`` or ``gpt-oss``
+    - auto tool choice is on
     - the optional ``openai-harmony`` Python package is importable
 
     The third condition keeps non-gpt-oss deployments free of an extra
@@ -3745,7 +3837,8 @@ def _detect_harmony_rendering() -> bool:
     HarmonyToolParser's existing text-flatten behavior also stays in force
     in that fallback so the response side is unchanged.
     """
-    if not _enable_auto_tool_choice or not _tool_call_parser:
+    parser_name, enabled = _effective_tool_config(engine)
+    if not enabled or not parser_name:
         return False
     try:
         from .utils.harmony_render import (
@@ -3754,14 +3847,14 @@ def _detect_harmony_rendering() -> bool:
         )
     except ImportError:
         return False
-    if not is_harmony_parser_name(_tool_call_parser):
+    if not is_harmony_parser_name(parser_name):
         return False
     if not HAS_HARMONY:
         logger.warning(
             "tool-call-parser=%s requested but `openai-harmony` is not "
             "installed; falling back to tokenizer.apply_chat_template. "
             "`pip install openai-harmony` to enable harmony rendering.",
-            _tool_call_parser,
+            parser_name,
         )
         return False
     return True
@@ -3798,7 +3891,8 @@ def _get_streaming_tool_parser(
 
     tokenizer = _get_engine_tokenizer(engine if engine is not None else _engine)
 
-    if _enable_auto_tool_choice and _tool_call_parser:
+    parser_name, enabled = _effective_tool_config(engine)
+    if enabled and parser_name:
         try:
             return _build_tool_parser(engine)
         except Exception as e:
@@ -4331,8 +4425,8 @@ def load_model(
         logger.info(f"{model_type} model loaded (simple mode): {model_name}")
 
     # Set native tool format support on the engine (thread-safe via instance property)
-    _engine.preserve_native_tool_format = _detect_native_tool_support()
-    _engine.use_harmony_rendering = _detect_harmony_rendering()
+    _engine.preserve_native_tool_format = _detect_native_tool_support(_engine)
+    _engine.use_harmony_rendering = _detect_harmony_rendering(_engine)
     if _engine.preserve_native_tool_format:
         logger.info(f"Native tool format enabled for parser: {_tool_call_parser}")
     if _engine.use_harmony_rendering:
@@ -5995,7 +6089,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     ```
     """
     _validate_model_name(request.model)
-    _validate_muse_glimmer_tool_names(request.tools)
+    _validate_muse_glimmer_tool_names(request.tools, request.model)
     effective_max_tokens = _resolve_request_max_tokens(request.max_tokens)
     _raise_if_outlines_response_format_requested(request.response_format)
     await _preflight_response_format_backend(raw_request)
@@ -6430,7 +6524,9 @@ async def create_anthropic_message(
     anthropic_request = AnthropicRequest(**body)
 
     _validate_model_name(anthropic_request.model)
-    _validate_muse_glimmer_tool_names(anthropic_request.tools)
+    _validate_muse_glimmer_tool_names(
+        anthropic_request.tools, anthropic_request.model
+    )
     effective_max_tokens = _resolve_request_max_tokens(anthropic_request.max_tokens)
 
     # --- Detailed request logging ---

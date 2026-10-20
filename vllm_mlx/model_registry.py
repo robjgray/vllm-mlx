@@ -128,7 +128,9 @@ class RegistryServeDefaults:
     max_tokens: int
     download_config: DownloadConfig
     auto_unload_idle_seconds: float = 0.0
-
+    reasoning_parser: str | None = None
+    tool_call_parser: str | None = None
+    enable_auto_tool_choice: bool = False
 
 @dataclass(frozen=True)
 class ContentionPolicy:
@@ -174,7 +176,10 @@ class RegisteredModel:
     stream_interval: int | None = None
     gpu_memory_utilization: float | None = None
     estimated_memory_bytes: int | None = None
-
+    reasoning_parser: str | None = None
+    tool_call_parser: str | None = None
+    enable_auto_tool_choice: bool | None = None
+    cache_memory_mb: int | None = None
 
 @dataclass(frozen=True)
 class ResolvedModelConfig:
@@ -202,7 +207,10 @@ class ResolvedModelConfig:
     gpu_memory_utilization: float
     scheduler_config: SchedulerConfig | None
     estimated_memory_bytes: int
-
+    reasoning_parser: str | None = None
+    tool_call_parser: str | None = None
+    enable_auto_tool_choice: bool = False
+    cache_memory_mb: int | None = None
 
 @dataclass
 class LoadedModel:
@@ -474,7 +482,37 @@ def build_memory_budget_report(
         scheduler_config is not None and memory_aware_prefix_cache_entries > 0
     )
     if cache_applies:
-        cache_memory_mb = getattr(scheduler_config, "cache_memory_mb", None)
+        # Per-entry overrides install a different limit per engine; the report
+        # line is informational and the warning compares one limit against the
+        # process-wide ceiling, so report the largest limit any entry will
+        # install. Entries without an override use the global scheduler value.
+        per_entry_cache_mb: list[int] = []
+        for name in sorted(registry):
+            entry = registry[name]
+            entry_continuous_batching = (
+                entry.continuous_batching
+                if entry.continuous_batching is not None
+                else defaults.continuous_batching
+            )
+            if not entry_continuous_batching:
+                continue
+            if (
+                scheduler_config is not None
+                and getattr(scheduler_config, "enable_prefix_cache", False)
+                and getattr(scheduler_config, "use_memory_aware_cache", False)
+                and (
+                    _registry_entry_uses_mllm_path(entry, defaults)
+                    or not getattr(scheduler_config, "use_paged_cache", False)
+                )
+            ):
+                per_entry_cache_mb.append(
+                    entry.cache_memory_mb
+                    if entry.cache_memory_mb is not None
+                    else getattr(scheduler_config, "cache_memory_mb", None)
+                )
+        cache_memory_mb = max(
+            (value for value in per_entry_cache_mb if value), default=None
+        )
         if cache_memory_mb:
             per_engine_cache_limit_bytes = int(cache_memory_mb) * (1024**2)
         else:
@@ -712,6 +750,51 @@ def load_registry_config(
             mllm_draft_kind = str(mllm_draft_kind)
         default_mllm_draft = item.get("default_mllm_draft")
 
+        reasoning_parser = item.get("reasoning_parser")
+        if reasoning_parser is not None and (
+            not isinstance(reasoning_parser, str) or not reasoning_parser.strip()
+        ):
+            raise ValueError(
+                f"models-config entry '{name}': "
+                "reasoning_parser must be a non-empty string"
+            )
+        tool_call_parser = item.get("tool_call_parser")
+        if tool_call_parser is not None and (
+            not isinstance(tool_call_parser, str) or not tool_call_parser.strip()
+        ):
+            raise ValueError(
+                f"models-config entry '{name}': "
+                "tool_call_parser must be a non-empty string"
+            )
+        enable_auto_tool_choice = item.get("enable_auto_tool_choice")
+        if enable_auto_tool_choice is not None and not isinstance(
+            enable_auto_tool_choice, bool
+        ):
+            raise ValueError(
+                f"models-config entry '{name}': "
+                "enable_auto_tool_choice must be a boolean"
+            )
+        if enable_auto_tool_choice and not tool_call_parser:
+            raise ValueError(
+                f"models-config entry '{name}': "
+                "enable_auto_tool_choice requires tool_call_parser"
+            )
+        raw_cache_memory_mb = item.get("cache_memory_mb")
+        cache_memory_mb = None
+        if raw_cache_memory_mb is not None:
+            try:
+                cache_memory_mb = int(raw_cache_memory_mb)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"models-config entry '{name}': "
+                    "cache_memory_mb must be a positive integer"
+                ) from None
+            if cache_memory_mb <= 0:
+                raise ValueError(
+                    f"models-config entry '{name}': "
+                    "cache_memory_mb must be a positive integer"
+                )
+
         if mllm_draft_model and not item.get("mllm"):
             raise ValueError(
                 f"models-config entry '{name}': mllm_draft_model requires mllm: true"
@@ -765,6 +848,10 @@ def load_registry_config(
             stream_interval=item.get("stream_interval"),
             gpu_memory_utilization=gpu_memory_utilization,
             estimated_memory_bytes=estimated_bytes,
+            reasoning_parser=reasoning_parser,
+            tool_call_parser=tool_call_parser,
+            enable_auto_tool_choice=enable_auto_tool_choice,
+            cache_memory_mb=cache_memory_mb,
         )
 
     return manager, registry
@@ -1330,6 +1417,9 @@ class ModelManager:
                 specprefill_keep_pct=config.specprefill_keep_pct,
                 specprefill_backbone_pct=config.specprefill_backbone_pct,
                 specprefill_draft_model=config.specprefill_draft_model,
+                reasoning_parser_name=config.reasoning_parser,
+                tool_call_parser_name=config.tool_call_parser,
+                auto_tool_choice=config.enable_auto_tool_choice,
             )
         else:
             engine = SimpleEngine(
@@ -1347,8 +1437,10 @@ class ModelManager:
                 mllm_draft_block_size=config.mllm_draft_block_size,
                 default_mllm_draft=config.default_mllm_draft,
                 prefix_trie_cache=config.prefix_trie_cache,
-                prefix_trie_cache_size=config.prefix_trie_cache_size,
                 prefix_trie_cache_memory_mb=config.prefix_trie_cache_memory_mb,
+                reasoning_parser_name=config.reasoning_parser,
+                tool_call_parser_name=config.tool_call_parser,
+                auto_tool_choice=config.enable_auto_tool_choice,
             )
 
         await engine.start()
@@ -1425,9 +1517,29 @@ class ModelManager:
             if entry.prefill_step_size is not None
             else self._defaults.prefill_step_size
         )
-        scheduler_config = _clone_scheduler_config(
-            self._defaults.scheduler_config, prefill_step_size=prefill_step_size
-        )
+        # A batched entry needs an explicit entry-private SchedulerConfig:
+        # when the CLI serves no scheduler flags (vexillm's registry mode),
+        # BatchedEngine would otherwise build its own default config and
+        # drop the per-entry cache_memory_mb / prefill_step_size overrides.
+        if self._defaults.scheduler_config is None and continuous_batching:
+            scheduler_config = _clone_scheduler_config(
+                SchedulerConfig(), prefill_step_size=prefill_step_size
+            )
+        else:
+            scheduler_config = _clone_scheduler_config(
+                self._defaults.scheduler_config, prefill_step_size=prefill_step_size
+            )
+        if entry.cache_memory_mb is not None:
+            cache_memory_mb: int | None = entry.cache_memory_mb
+        elif self._defaults.scheduler_config is not None:
+            cache_memory_mb = self._defaults.scheduler_config.cache_memory_mb
+        else:
+            cache_memory_mb = None
+        # BatchedEngine reads cache_memory_mb only from its SchedulerConfig, so a
+        # per-entry override must land on the entry-private clone; the clone is
+        # never shared with another entry, so the in-place set is safe.
+        if entry.cache_memory_mb is not None and scheduler_config is not None:
+            scheduler_config.cache_memory_mb = entry.cache_memory_mb
         specprefill_enabled = (
             entry.specprefill_enabled
             if entry.specprefill_enabled is not None
@@ -1482,6 +1594,23 @@ class ModelManager:
         mllm_draft_kind = entry.mllm_draft_kind
         mllm_draft_block_size = entry.mllm_draft_block_size
         default_mllm_draft = bool(entry.default_mllm_draft)
+        reasoning_parser = (
+            entry.reasoning_parser
+            if entry.reasoning_parser is not None
+            else self._defaults.reasoning_parser
+        )
+        tool_call_parser = (
+            entry.tool_call_parser
+            if entry.tool_call_parser is not None
+            else self._defaults.tool_call_parser
+        )
+        enable_auto_tool_choice = (
+            bool(entry.enable_auto_tool_choice)
+            if entry.enable_auto_tool_choice is not None
+            else self._defaults.enable_auto_tool_choice
+        )
+        if enable_auto_tool_choice and not tool_call_parser:
+            enable_auto_tool_choice = False
         estimated_memory_bytes = self._resolve_estimated_bytes(entry, resolved_source)
 
         return ResolvedModelConfig(
@@ -1507,4 +1636,8 @@ class ModelManager:
             gpu_memory_utilization=gpu_memory_utilization,
             scheduler_config=scheduler_config,
             estimated_memory_bytes=estimated_memory_bytes,
+            reasoning_parser=reasoning_parser,
+            tool_call_parser=tool_call_parser,
+            enable_auto_tool_choice=enable_auto_tool_choice,
+            cache_memory_mb=cache_memory_mb,
         )

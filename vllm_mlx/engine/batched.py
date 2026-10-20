@@ -183,6 +183,9 @@ class BatchedEngine(BaseEngine):
         specprefill_backbone_pct: float = 0.0,
         specprefill_draft_model: str | None = None,
         model_path: str | None = None,
+        reasoning_parser_name: str | None = None,
+        tool_call_parser_name: str | None = None,
+        auto_tool_choice: bool = False,
     ):
         """
         Initialize the batched engine.
@@ -225,6 +228,9 @@ class BatchedEngine(BaseEngine):
         self._specprefill_backbone_pct = specprefill_backbone_pct
         self._specprefill_draft_model_path = specprefill_draft_model
         self._specprefill_draft_model = None
+        self._reasoning_parser_name = reasoning_parser_name
+        self._tool_call_parser_name = tool_call_parser_name
+        self._auto_tool_choice = auto_tool_choice
         self._is_mllm = force_mllm or is_mllm_model(self._model_path)
 
         self._model = None

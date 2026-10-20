@@ -445,6 +445,11 @@ def serve_command(args):
             max_tokens=args.max_tokens,
             download_config=download_config,
             auto_unload_idle_seconds=args.auto_unload_idle_seconds,
+            reasoning_parser=args.reasoning_parser,
+            tool_call_parser=args.tool_call_parser,
+            enable_auto_tool_choice=bool(
+                args.enable_auto_tool_choice and args.tool_call_parser
+            ),
         )
         load_model_registry(
             models_config,

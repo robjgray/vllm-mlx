@@ -277,6 +277,33 @@ class BaseEngine(ABC):
     def preserve_native_tool_format(self, value: bool) -> None:
         self._preserve_native_tool_format = value
 
+    @property
+    def reasoning_parser_name(self) -> str | None:
+        """Per-engine reasoning parser name; None falls back to server global."""
+        return getattr(self, "_reasoning_parser_name", None)
+
+    @reasoning_parser_name.setter
+    def reasoning_parser_name(self, value: str | None) -> None:
+        self._reasoning_parser_name = value
+
+    @property
+    def tool_call_parser_name(self) -> str | None:
+        """Per-engine tool parser name; None falls back to server global."""
+        return getattr(self, "_tool_call_parser_name", None)
+
+    @tool_call_parser_name.setter
+    def tool_call_parser_name(self, value: str | None) -> None:
+        self._tool_call_parser_name = value
+
+    @property
+    def auto_tool_choice(self) -> bool:
+        """Per-engine auto tool choice; False falls back to server global."""
+        return bool(getattr(self, "_auto_tool_choice", False))
+
+    @auto_tool_choice.setter
+    def auto_tool_choice(self, value: bool) -> None:
+        self._auto_tool_choice = value
+
     def prepare_for_start(self) -> None:
         """Run blocking startup work before async engine start.
 

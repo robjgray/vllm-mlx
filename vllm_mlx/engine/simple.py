@@ -174,6 +174,9 @@ class SimpleEngine(BaseEngine):
         prefix_trie_cache_memory_mb: int | None = None,
         default_mllm_draft: bool = False,
         model_path: str | None = None,
+        reasoning_parser_name: str | None = None,
+        tool_call_parser_name: str | None = None,
+        auto_tool_choice: bool = False,
     ):
         """
         Initialize the simple engine.
@@ -253,7 +256,9 @@ class SimpleEngine(BaseEngine):
             "tokens_saved": 0,
         }
         self._default_mllm_draft = default_mllm_draft
-
+        self._reasoning_parser_name = reasoning_parser_name
+        self._tool_call_parser_name = tool_call_parser_name
+        self._auto_tool_choice = auto_tool_choice
         # KV cache size limit
         self._max_kv_size = max_kv_size
 
