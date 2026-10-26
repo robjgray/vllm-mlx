@@ -23,7 +23,16 @@ from mlx_lm.generate import BatchGenerator
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
-from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+from .batch_compat import (
+    _normalize_logits_processors,
+    _sanitize_batch_generator_logits_processors,
+)
+from .memory_cache import (
+    MemoryAwarePrefixCache,
+    MemoryCacheConfig,
+    _is_cache_layer_trimmable,
+    _trim_cache_offset,
+)
 from .paged_cache import PagedCacheManager
 from .ssd_cache import SSDCacheConfig, SSDCacheTier
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
@@ -41,28 +50,6 @@ CACHE_CORRUPTION_PATTERNS = [
     "cache",
     "BatchKVCache",
 ]
-
-
-def _normalize_logits_processors(logits_processors):
-    """Normalize empty per-sequence processor slots to lists."""
-    if logits_processors is None:
-        return None
-    return [processors or [] for processors in logits_processors]
-
-
-def _sanitize_batch_generator_logits_processors(batch_generator) -> None:
-    """Sanitize stale BatchGenerator processor state before decode."""
-    active_batch = getattr(batch_generator, "active_batch", None)
-    if active_batch is not None and hasattr(active_batch, "logits_processors"):
-        active_batch.logits_processors = _normalize_logits_processors(
-            active_batch.logits_processors
-        )
-
-    partial = getattr(batch_generator, "_partial", None)
-    if isinstance(partial, dict) and "logits_processors" in partial:
-        partial["logits_processors"] = _normalize_logits_processors(
-            partial["logits_processors"]
-        )
 
 
 class SchedulingPolicy(Enum):
@@ -2326,6 +2313,45 @@ class Scheduler:
         """Get number of running requests."""
         return len(self.running)
 
+    def _prepare_full_prompt_replay(self, request: Request) -> bool:
+        """Own and rewind a proven full-coverage cache before last-token replay."""
+        tokens = request.prompt_token_ids
+        cache = request.prompt_cache
+        if (
+            self.memory_aware_cache is None
+            or not cache
+            or not tokens
+            or len(tokens) < 2
+        ):
+            return False
+        try:
+            for layer in cache:
+                offset = getattr(layer, "offset", None)
+                if (
+                    not _is_cache_layer_trimmable(layer)
+                    or type(offset) is not int
+                    or offset != len(tokens)
+                ):
+                    return False
+                for name in ("keys", "values"):
+                    shape: Any = getattr(getattr(layer, name, None), "shape", ())
+                    if len(shape) < 3 or shape[-2] < len(tokens):
+                        return False
+            owned = self.memory_aware_cache.clone_for_replay(cache)
+            if not owned:
+                return False
+            rewound = _trim_cache_offset(owned, 1)
+            if any(layer.offset != len(tokens) - 1 for layer in rewound):
+                return False
+        except Exception:
+            logger.debug("Full prompt cache replay rejected", exc_info=True)
+            return False
+
+        request.prompt_cache = rewound
+        request.cached_tokens = len(tokens) - 1
+        request.remaining_tokens = tokens[-1:]
+        return True
+
     def _schedule_waiting(self) -> List[Request]:
         """
         Move requests from waiting queue to running.
@@ -2356,31 +2382,30 @@ class Scheduler:
             # Note: Don't use `remaining_tokens or prompt_token_ids` because empty list
             # is falsy in Python. For exact cache match, remaining_tokens=[] but we should
             # pass just the last token so BatchGenerator can start generation.
+            tokens_to_process: Optional[List[int]]
             if (
                 request.remaining_tokens is not None
                 and len(request.remaining_tokens) == 0
             ):
-                # Exact cache match. Re-feeding the last token is only correct
-                # when the cached state stops one token short of the key; for a
-                # state that already covers the whole key it duplicates that
-                # token in the KV cache and the model then answers from a
-                # corrupted context (measured: same prompt, different output).
-                # Entries stored post-prefill cover the full key, so drop the
-                # cache and prefill instead of guessing which kind this is.
+                # Full-coverage states must be rewound before replaying the
+                # last token. Leave stored snapshots untouched and fall back
+                # to cold prefill when safe rewind cannot be established.
                 if getattr(request, "cache_hit_type", None) in {
                     "exact",
                     "supersequence",
+                    "ssd_hit",
                 }:
-                    logger.debug(
-                        "[cache] %s match on a full-coverage entry; "
-                        "prefilling to avoid duplicating the last token",
-                        request.cache_hit_type,
-                    )
-                    cache_to_use = None
-                    request.prompt_cache = None
-                    request.cached_tokens = 0
-                    request.remaining_tokens = request.prompt_token_ids
-                    tokens_to_process = request.prompt_token_ids
+                    if self._prepare_full_prompt_replay(request):
+                        tokens_to_process = request.remaining_tokens
+                    else:
+                        logger.debug(
+                            "[cache] %s match cannot be safely rewound; prefilling",
+                            request.cache_hit_type,
+                        )
+                        request.prompt_cache = None
+                        request.cached_tokens = 0
+                        request.remaining_tokens = request.prompt_token_ids
+                        tokens_to_process = request.prompt_token_ids
                 else:
                     tokens_to_process = request.prompt_token_ids[-1:]
             elif request.remaining_tokens:
@@ -2470,11 +2495,21 @@ class Scheduler:
             # Wrap in try/except: if cache shapes are incompatible
             # (e.g. stale entry after BatchGenerator recreation),
             # fall back to no-cache insert instead of crashing.
-            insert_kwargs = {
+            prompt_tokens = request.prompt_token_ids or []
+            # all_tokens seeds only the cached prefix. BatchGenerator appends
+            # tokens_to_process itself before running logits processors.
+            cached_history = (
+                prompt_tokens[: len(prompt_tokens) - len(tokens_to_process or [])]
+                if cache_to_use is not None
+                else []
+            )
+            insert_kwargs: Dict[str, Any] = {
                 "max_tokens": [request.sampling_params.max_tokens],
                 "caches": [cache_to_use] if cache_to_use else None,
-                # Always pass logits_processors (even empty list) so that
-                # mlx_lm BatchGenerator never stores None per-sequence.
+                "all_tokens": [cached_history],
+                # Keep queued per-sequence state explicit. mlx-lm 0.31.3 can
+                # still turn this empty list into None while extending a
+                # prompt batch; batch_compat normalizes that transition.
                 "logits_processors": [lp] if lp else [[]],
             }
             try:
@@ -2494,6 +2529,7 @@ class Scheduler:
                     request.remaining_tokens = request.prompt_token_ids
                     tokens_to_process = request.prompt_token_ids
                     insert_kwargs["caches"] = None
+                    insert_kwargs["all_tokens"] = [[]]
                     uids = self.batch_generator.insert(
                         [tokens_to_process],
                         **insert_kwargs,
