@@ -33,12 +33,14 @@ You can still use global serve flags such as:
 
 - `--api-key`
 - `--rate-limit`
-- `--timeout`
-- `--default-temperature`
-- `--default-top-p`
-- `--reasoning-parser`
-- `--enable-auto-tool-choice`
-- `--tool-call-parser`
+
+Most other serve flags are also accepted **per entry** under their flag name
+(`timeout`, `default_temperature`, `reasoning_parser`, …); see
+[Model Entry Fields](#model-entry-fields). Request-time keys set an entry
+default that still loses to an explicit per-request value; an entry value
+beats the CLI global default for that entry. Keys with one value for the whole
+process (host, port, auth, download config, …) are refused in an entry with a
+message telling you to set them on the serve invocation.
 
 Do not combine `--models-config` with:
 
@@ -262,8 +264,22 @@ Optional:
 - `enable_auto_tool_choice`: enable auto tool choice for this entry (requires `tool_call_parser`); resolved per request
 - `cache_memory_mb`: override the scheduler's prefix-cache memory cap for this entry's engine (must be a positive integer; applies only to continuous-batching entries)
 - `stream_interval`
-- `gpu_memory_utilization`
+- `gpu_memory_utilization` (note: the Metal memory limit is process-wide, so the last-loaded entry wins)
 - `estimated_memory_gb`
+- `trust_remote_code`: allow remote code for this entry's model only
+- any `SchedulerConfig` field under its flag name (e.g. `chunked_prefill_tokens`,
+  `kv_cache_quantization`, `enable_prefix_cache`; requires `continuous_batching: true`
+  on the entry)
+- request-time defaults under their flag names: `max_tokens`, `max_request_tokens`
+  (the per-request ceiling), `timeout`, `default_temperature`, `default_top_p`,
+  `default_top_k`, `default_min_p`, `default_presence_penalty`,
+  `default_repetition_penalty`, `default_thinking_token_budget`,
+  `default_chat_template_kwargs`
+
+Unknown keys abort startup with a suggestion. A key whose value is shared by
+the whole server (host, port, auth, download config, …) is refused with a
+message naming the serve invocation as the place to set it. `max_tokens` may
+not exceed `max_request_tokens` on the same entry.
 
 For continuous-batching multimodal routes, SpecPrefill is opt-in and currently
 supports exact Qwen3-VL and Qwen3.5 dense and MoE runtime modules. It preserves
@@ -387,7 +403,5 @@ Keep these global unless you have a strong reason not to:
 
 - auth
 - rate limits
-- request timeout
-- reasoning parser selection
-- tool parser selection
+- host/port and other process-wide transport settings
 - manager memory budget / contention policy

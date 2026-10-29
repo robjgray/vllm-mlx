@@ -39,6 +39,7 @@ The server provides:
 
 import argparse
 import asyncio
+import contextvars
 import copy
 import hashlib
 from dataclasses import dataclass
@@ -233,54 +234,72 @@ _FALLBACK_REPETITION_PENALTY = 1.0
 
 
 def _resolve_temperature(request_value: float | None) -> float:
-    """Resolve temperature: request > CLI default > fallback."""
+    """Resolve temperature: request > entry default > CLI default > fallback."""
     if request_value is not None:
         return request_value
+    entry = current_request_defaults()
+    if entry is not None and entry.temperature is not None:
+        return entry.temperature
     if _default_temperature is not None:
         return _default_temperature
     return _FALLBACK_TEMPERATURE
 
 
 def _resolve_top_p(request_value: float | None) -> float:
-    """Resolve top_p: request > CLI default > fallback."""
+    """Resolve top_p: request > entry default > CLI default > fallback."""
     if request_value is not None:
         return request_value
+    entry = current_request_defaults()
+    if entry is not None and entry.top_p is not None:
+        return entry.top_p
     if _default_top_p is not None:
         return _default_top_p
     return _FALLBACK_TOP_P
 
 
 def _resolve_top_k(request_value: int | None) -> int:
-    """Resolve top_k: request > CLI default > fallback."""
+    """Resolve top_k: request > entry default > CLI default > fallback."""
     if request_value is not None:
         return request_value
+    entry = current_request_defaults()
+    if entry is not None and entry.top_k is not None:
+        return entry.top_k
     if _default_top_k is not None:
         return _default_top_k
     return _FALLBACK_TOP_K
 
 
 def _resolve_min_p(request_value: float | None) -> float:
-    """Resolve min_p: request > CLI default > fallback."""
+    """Resolve min_p: request > entry default > CLI default > fallback."""
     if request_value is not None:
         return request_value
+    entry = current_request_defaults()
+    if entry is not None and entry.min_p is not None:
+        return entry.min_p
     if _default_min_p is not None:
         return _default_min_p
     return _FALLBACK_MIN_P
 
 
 def _resolve_presence_penalty(request_value: float | None) -> float:
-    """Resolve presence_penalty: request > CLI default > fallback."""
+    """Resolve presence_penalty: request > entry > CLI default > fallback."""
     if request_value is not None:
         return request_value
+    entry = current_request_defaults()
+    if entry is not None and entry.presence_penalty is not None:
+        return entry.presence_penalty
     if _default_presence_penalty is not None:
         return _default_presence_penalty
     return _FALLBACK_PRESENCE_PENALTY
 
 
 def _resolve_repetition_penalty(request_value: float | None) -> float:
-    """Resolve repetition_penalty: request > CLI default > fallback."""
+    """Resolve repetition_penalty: request > entry > CLI default > fallback."""
     if request_value is not None:
         return request_value
+    entry = current_request_defaults()
+    if entry is not None and entry.repetition_penalty is not None:
+        return entry.repetition_penalty
     if _default_repetition_penalty is not None:
         return _default_repetition_penalty
     return _FALLBACK_REPETITION_PENALTY
@@ -288,12 +307,16 @@ def _resolve_repetition_penalty(request_value: float | None) -> float:
 
 def _resolve_request_max_tokens(requested_value: int | None) -> int:
     """Resolve and validate a request's max_tokens budget."""
+    entry = current_request_defaults()
+    entry_default = entry.max_tokens if entry is not None else None
+    entry_limit = entry.max_request_tokens if entry is not None else None
+    limit = entry_limit if entry_limit is not None else _max_request_tokens
     if requested_value is None:
-        return _default_max_tokens
-    if requested_value > _max_request_tokens:
+        return entry_default if entry_default is not None else _default_max_tokens
+    if requested_value > limit:
         raise HTTPException(
             status_code=400,
-            detail=f"max_tokens exceeds server limit ({_max_request_tokens})",
+            detail=f"max_tokens exceeds server limit ({limit})",
         )
     return requested_value
 
@@ -302,10 +325,13 @@ def _resolve_chat_template_kwargs(
     request_value: dict[str, object] | None,
     request_reasoning_effort: str | None = None,
 ) -> dict[str, object]:
-    """Resolve chat kwargs: server default < effort < explicit request kwargs."""
+    """Resolve chat kwargs: server default < entry < effort < request kwargs."""
     resolved: dict[str, object] = {}
     if _default_chat_template_kwargs:
         resolved.update(_default_chat_template_kwargs)
+    entry = current_request_defaults()
+    if entry is not None and entry.chat_template_kwargs:
+        resolved.update(entry.chat_template_kwargs)
     if request_reasoning_effort is not None:
         resolved["reasoning_effort"] = request_reasoning_effort
     if request_value:
@@ -957,7 +983,12 @@ def _prepare_chat_completion_invocation(
     # Thinking-aware logits processor: cap reasoning tokens when a budget is set.
     # Only build when thinking is actually enabled for this request -- a CLI
     # default budget should not alter non-thinking requests.
-    thinking_budget = request.thinking_token_budget or _default_thinking_token_budget
+    entry = current_request_defaults()
+    thinking_budget = (
+        request.thinking_token_budget
+        or (entry.thinking_token_budget if entry is not None else None)
+        or _default_thinking_token_budget
+    )
     enable_thinking = chat_kwargs.get("enable_thinking", True)
     thinking_proc = None
     if thinking_budget is not None and enable_thinking is not False:
@@ -1716,15 +1747,24 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
         logger.info(f"Preparing BatchedEngine for residency: {spec.model_name}")
         return BatchedEngine(
             model_name=spec.model_name,
+            trust_remote_code=spec.trust_remote_code,
             scheduler_config=spec.scheduler_config,
             stream_interval=spec.stream_interval,
             force_mllm=spec.force_mllm,
+            gpu_memory_utilization=spec.gpu_memory_utilization,
+            mllm_draft_model=spec.mllm_draft_model,
+            mllm_draft_kind=spec.mllm_draft_kind,
+            mllm_draft_block_size=spec.mllm_draft_block_size,
+            default_mllm_draft=spec.default_mllm_draft,
             specprefill_enabled=spec.specprefill_enabled,
             specprefill_threshold=spec.specprefill_threshold,
             specprefill_keep_pct=spec.specprefill_keep_pct,
             specprefill_backbone_pct=spec.specprefill_backbone_pct,
             specprefill_draft_model=spec.specprefill_draft_model,
             model_path=spec.model_path,
+            reasoning_parser_name=spec.reasoning_parser,
+            tool_call_parser_name=spec.tool_call_parser,
+            auto_tool_choice=spec.enable_auto_tool_choice,
         )
 
     from .engine.simple import SimpleEngine
@@ -1735,6 +1775,7 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
     )
     return SimpleEngine(
         model_name=spec.model_name,
+        trust_remote_code=spec.trust_remote_code,
         force_mllm=spec.force_mllm,
         mtp=spec.mtp,
         prefill_step_size=spec.prefill_step_size,
@@ -1744,10 +1785,17 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
         specprefill_backbone_pct=spec.specprefill_backbone_pct,
         specprefill_draft_model=spec.specprefill_draft_model,
         max_kv_size=max_kv_size,
+        mllm_draft_model=spec.mllm_draft_model,
+        mllm_draft_kind=spec.mllm_draft_kind,
+        mllm_draft_block_size=spec.mllm_draft_block_size,
+        default_mllm_draft=spec.default_mllm_draft,
         prefix_trie_cache=spec.prefix_trie_cache,
         prefix_trie_cache_size=spec.prefix_trie_cache_size,
         prefix_trie_cache_memory_mb=spec.prefix_trie_cache_memory_mb,
         model_path=spec.model_path,
+        reasoning_parser_name=spec.reasoning_parser,
+        tool_call_parser_name=spec.tool_call_parser,
+        auto_tool_choice=spec.enable_auto_tool_choice,
     )
 
 
@@ -2425,6 +2473,28 @@ def _finalize_streaming_tool_calls(
     return finalized
 
 
+# Per-entry request-time defaults, scoped to the request that named the entry.
+#
+# These are the values `serve <model>` sets in module globals (_default_top_k,
+# _max_request_tokens, ...). A registry serves many models per process, so one
+# global cannot hold them all. They are resolved before engine acquisition
+# (server._resolve_request_max_tokens / _start_request_budget run before the
+# engine exists), so an engine attribute cannot carry them either.
+#
+# The request's own model name is already validated against the registry here,
+# before any resolver runs, so this chokepoint is where the entry's defaults
+# become visible to the rest of that request. `serve <model>` never takes this
+# branch and therefore never sets the variable: it keeps reading the globals.
+_REQUEST_DEFAULTS: contextvars.ContextVar["RegistryRequestDefaults | None"] = (
+    contextvars.ContextVar("vllm_mlx_request_defaults", default=None)
+)
+
+
+def current_request_defaults() -> "RegistryRequestDefaults | None":
+    """The registry entry's request-time defaults for the current request."""
+    return _REQUEST_DEFAULTS.get()
+
+
 def _validate_model_name(request_model: str) -> None:
     """Validate that the request model name matches the served model."""
     if _model_manager is not None:
@@ -2437,6 +2507,10 @@ def _validate_model_name(request_model: str) -> None:
                     f"Available models: {available}"
                 ),
             )
+        lookup = getattr(_model_manager, "request_defaults", None)
+        # A manager that does not expose per-entry defaults (a test double, or
+        # a future manager without them) simply resolves from the globals.
+        _REQUEST_DEFAULTS.set(lookup(request_model) if lookup is not None else None)
         return
 
     if _model_name and request_model != _model_name:
@@ -4330,6 +4404,14 @@ def load_model(
             prefix_trie_cache_size=prefix_trie_cache_size,
             prefix_trie_cache_memory_mb=prefix_trie_cache_memory_mb,
             model_path=model_path,
+            # Engine-construction fields the eager path below already passes
+            # straight to the engine; without them lazy load would drop them.
+            trust_remote_code=trust_remote_code,
+            gpu_memory_utilization=gpu_memory_utilization,
+            mllm_draft_model=mllm_draft_model,
+            mllm_draft_kind=mllm_draft_kind,
+            mllm_draft_block_size=mllm_draft_block_size,
+            default_mllm_draft=default_mllm_draft,
         )
         _residency_manager = ResidencyManager(
             _engine_factory,
@@ -5769,7 +5851,9 @@ async def _wait_with_disconnect(
 
 def _start_request_budget(timeout: float | None) -> tuple[float, float]:
     """Return the total timeout and absolute deadline for a request."""
-    total_timeout = timeout or _default_timeout
+    entry = current_request_defaults()
+    entry_timeout = entry.timeout if entry is not None else None
+    total_timeout = timeout or entry_timeout or _default_timeout
     return total_timeout, time.monotonic() + total_timeout
 
 

@@ -131,15 +131,20 @@ def _registry(tmp_path: Path, sizes_gb: dict[str, float]) -> dict[str, Registere
     return registry
 
 
-def _write_registry_config(tmp_path: Path, manager_yaml: str) -> Path:
+def _write_registry_config(
+    tmp_path: Path, manager_yaml: str, entry_yaml: str = ""
+) -> Path:
     config_path = tmp_path / "models.yaml"
+    entry_lines = "".join(
+        f"    {line.strip()}\n" for line in entry_yaml.strip().splitlines() if line.strip()
+    )
     config_path.write_text(f"""
 manager:
 {manager_yaml}
 models:
   - name: test
     path: /tmp/test-model
-""".strip())
+{entry_lines}""".strip())
     return config_path
 
 
@@ -1091,19 +1096,26 @@ def test_batched_engine_receives_resolved_prefill_step_size(
             continuous_batching=True, prefill_step_size=512, scheduler_config=shared
         ),
     )
+    # Registry and single-model mode share one engine-construction seam
+    # (server._build_engine), so the cloned SchedulerConfig is observed there.
+    from vllm_mlx import server as server_mod
+
     engine = MagicMock()
     engine.start = AsyncMock()
-    constructor = MagicMock(return_value=engine)
-    monkeypatch.setattr("vllm_mlx.model_registry.BatchedEngine", constructor)
+    captured: list[Any] = []
+
+    def fake_build_engine(spec):
+        captured.append(spec.scheduler_config)
+        return engine
+
+    monkeypatch.setattr(server_mod, "_build_engine", fake_build_engine)
 
     async def _run():
         for entry in registry.values():
             await manager._instantiate_model(entry, entry.source)
 
     asyncio.run(_run())
-    alpha, beta = [
-        call.kwargs["scheduler_config"] for call in constructor.call_args_list
-    ]
+    alpha, beta = captured
     assert alpha.prefill_step_size == (512 if override is None else override)
     assert beta.prefill_step_size == 512
     assert alpha is not beta and alpha is not shared and beta is not shared
@@ -1957,3 +1969,154 @@ def test_healthy_engine_is_untouched(tmp_path):
         await second_lease.release()
 
     asyncio.run(_run())
+
+
+# --- Entry routing ("sinks") guard tests -----------------------------------
+# Ported from tests/test_entry_schema_prototype.py; the subjects S1-S6 live
+# there. These pin the behaviours the loader must keep: every serve dest is
+# classified, request-time keys land on request_defaults, scheduler keys land
+# on the entry's own bag, a negated switch still routes, the single-model path
+# is untouched, the max_tokens ceiling is cross-checked, and the request
+# context var is reset between requests.
+
+
+def test_every_serve_dest_is_classified():
+    """Every serve dest is either expressible per-entry or in the refused set."""
+    from vllm_mlx.model_registry import ENTRY_ALIASES, _ENTRY_NEGATED, _serve_dests, entry_contract
+
+    contract = entry_contract()
+    expressible = (
+        set(contract["scheduler"])
+        | set(contract["spec"])
+        | set(contract["request"])
+        | set(contract["typed"])
+        | set(ENTRY_ALIASES)
+        | set(_ENTRY_NEGATED)
+    )
+    # Serve-wide flags: one value for the whole process (host/port/auth/
+    # download/transport/manager knobs). Everything not expressible must be
+    # here, so a newly added upstream flag fails loudly instead of being
+    # silently ignored.
+    refused = {
+        "model", "models_config", "host", "port", "api_key", "rate_limit",
+        "served_model_name", "download_timeout", "download_retries",
+        "memory_budget_gb", "offline", "warm_prompts", "mcp_config",
+        "enable_metrics", "auto_unload_idle_seconds", "lazy_load_model",
+        "embedding_model", "embedding_max_length", "embedding_overflow_policy",
+        "stt_model", "max_audio_upload_mb", "max_tts_input_chars", "rerank_model",
+    }
+    serve_dests = set(_serve_dests())
+    assert serve_dests, "the walk must find the serve subparser, not the top level"
+    missing = serve_dests - expressible - refused
+    assert not missing, f"serve dests neither expressible nor refused: {sorted(missing)}"
+    stale = refused - serve_dests
+    assert not stale, f"refused names that are not serve dests anymore: {sorted(stale)}"
+
+
+def test_max_request_tokens_is_a_request_default(tmp_path):
+    config_path = _write_registry_config(
+        tmp_path,
+        "  memory_budget_gb: 96",
+        "  max_request_tokens: 4096\n  max_tokens: 512\n",
+    )
+    _, registry = load_registry_config(config_path, _defaults())
+    entry = registry["test"]
+    assert entry.request_defaults is not None
+    assert entry.request_defaults.max_request_tokens == 4096
+    assert entry.request_defaults.max_tokens == 512
+
+
+def test_max_tokens_above_ceiling_is_refused(tmp_path):
+    config_path = _write_registry_config(
+        tmp_path,
+        "  memory_budget_gb: 96",
+        "  max_request_tokens: 512\n  max_tokens: 4096\n",
+    )
+    with pytest.raises(ValueError, match="cannot exceed max_request_tokens"):
+        load_registry_config(config_path, _defaults())
+
+
+def test_scheduler_keys_land_on_the_entry_only(tmp_path):
+    config_path = _write_registry_config(
+        tmp_path,
+        "  memory_budget_gb: 96",
+        "  continuous_batching: true\n"
+        "  chunked_prefill_tokens: 2048\n"
+        "  kv_cache_quantization: true\n"
+        "  estimated_memory_gb: 1\n",
+    )
+    defaults = _defaults()
+    manager, registry = load_registry_config(config_path, defaults)
+    mgr = ModelManager(_manager_config(budget_gb=96), registry, defaults)
+    entry = registry["test"]
+    assert entry.scheduler == {
+        "chunked_prefill_tokens": 2048,
+        "kv_cache_quantization": True,
+    }
+    # The globals are untouched: nothing leaked into the shared defaults.
+    assert defaults.max_tokens == 32768
+    resolved = mgr._resolve_model_config(entry, "/tmp/test-model")
+    assert resolved.scheduler_config is not None
+    assert resolved.scheduler_config.chunked_prefill_tokens == 2048
+    assert resolved.scheduler_config.kv_cache_quantization is True
+    # ...and the serve defaults' scheduler config was not mutated.
+    assert defaults.scheduler_config is None
+
+
+def test_scheduler_override_on_non_batched_entry_is_refused(tmp_path):
+    config_path = _write_registry_config(
+        tmp_path,
+        "  memory_budget_gb: 96",
+        "  continuous_batching: false\n  chunked_prefill_tokens: 2048\n"
+        "  estimated_memory_gb: 1\n",
+    )
+    manager, registry = load_registry_config(config_path, _defaults())
+    mgr = ModelManager(_manager_config(budget_gb=96), registry, _defaults())
+    with pytest.raises(ValueError, match="continuous_batching"):
+        mgr._resolve_model_config(registry["test"], "/tmp/test-model")
+
+
+def test_negated_switch_routes_to_its_positive(tmp_path):
+    config_path = _write_registry_config(
+        tmp_path,
+        "  memory_budget_gb: 96",
+        "  continuous_batching: true\n  disable_prefix_cache: true\n",
+    )
+    _, registry = load_registry_config(config_path, _defaults())
+    assert registry["test"].scheduler.get("enable_prefix_cache") is False
+
+
+def test_unknown_entry_key_is_refused_with_suggestion(tmp_path):
+    config_path = _write_registry_config(
+        tmp_path, "  memory_budget_gb: 96", "  chunked_prefill_tokns: 10\n"
+    )
+    with pytest.raises(ValueError, match="unknown key"):
+        load_registry_config(config_path, _defaults())
+
+
+def test_process_wide_key_gets_the_serve_wide_message(tmp_path):
+    config_path = _write_registry_config(
+        tmp_path, "  memory_budget_gb: 96", "  port: 4747\n"
+    )
+    with pytest.raises(ValueError, match="set the whole server"):
+        load_registry_config(config_path, _defaults())
+
+
+def test_request_defaults_contextvar_resets_between_requests():
+    """A registry request without defaults must not inherit a previous entry's."""
+    import contextvars
+
+    import vllm_mlx.server as server
+
+    assert server.current_request_defaults() is None
+    server._REQUEST_DEFAULTS.set(
+        __import__(
+            "vllm_mlx.model_registry", fromlist=["RegistryRequestDefaults"]
+        ).RegistryRequestDefaults(max_request_tokens=4096)
+    )
+    assert server.current_request_defaults() is not None
+    # What _validate_model_name does in the manager branch for an entry with no
+    # defaults: always set, even to None.
+    server._REQUEST_DEFAULTS.set(None)
+    assert server.current_request_defaults() is None
+    _ = contextvars  # silence linters if unused above

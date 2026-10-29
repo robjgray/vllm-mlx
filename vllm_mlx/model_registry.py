@@ -10,21 +10,28 @@ behaviour.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import dataclasses
+import difflib
+import enum
 import logging
 import math
 import os
 import time
+import types
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
 
+from pydantic import TypeAdapter
+
+from .api.models import ChatCompletionRequest
 from .api.utils import is_mllm_model
 from .cli_arg_types import parse_positive_finite_float
 from .engine.base import BaseEngine, suspend_cancellation
-from .engine.batched import BatchedEngine
-from .engine.simple import SimpleEngine
+from .lifecycle import ModelSpec
 from .scheduler import SchedulerConfig
 from .utils.download import DownloadConfig, ensure_model_downloaded
 
@@ -106,6 +113,211 @@ ContentionStrategy = Literal[
 EngineFactory = Callable[["ResolvedModelConfig"], BaseEngine]
 
 
+# ============================================================================
+# Entry contract: three typed sinks, each validating itself
+# ============================================================================
+#
+# A registry entry is not a schema of its own. It is a set of keys routed to the
+# three objects that already define what a *serve* invocation means:
+#
+#   scheduler  -- SchedulerConfig fields, applied with dataclasses.replace onto
+#                 the entry's own clone (replace re-runs __post_init__, so the
+#                 scheduler validates itself and unknown kwargs raise).
+#   spec       -- ModelSpec fields, the engine-construction inputs the
+#                 single-model path already uses (_build_engine).
+#   request    -- request-time serve defaults, i.e. the values `serve <model>`
+#                 puts in server.py module globals.
+#
+# Every sink derives its own key set from the object it feeds, so this module
+# keeps no flag list. A key that reaches no sink is either a typo or a
+# genuinely process-wide serve flag; both are refused loudly with different
+# wording (see load_registry_config).
+
+# YAML key -> the RegisteredModel field it means. Only keys whose spelling
+# differs need an entry; negated twins map onto the positive field and invert.
+ENTRY_ALIASES: dict[str, str] = {
+    "mllm": "force_mllm",
+    "specprefill": "specprefill_enabled",
+}
+_ENTRY_NEGATED: dict[str, str] = {
+    "disable_prefix_cache": "enable_prefix_cache",
+    "no_memory_aware_cache": "use_memory_aware_cache",
+}
+
+# How a ResolvedModelConfig becomes a ModelSpec. This mapping IS the list of
+# spec fields the manager fills itself, so entry_contract() can exclude them
+# from the spec sink without a second hand-kept list.
+_SPEC_FROM_CONFIG: dict[str, str] = {
+    "model_name": "resolved_source",
+    "use_batching": "continuous_batching",
+    "scheduler_config": "scheduler_config",
+    "stream_interval": "stream_interval",
+    "force_mllm": "force_mllm",
+    "mtp": "enable_mtp",
+    "prefill_step_size": "prefill_step_size",
+    "specprefill_enabled": "specprefill_enabled",
+    "specprefill_threshold": "specprefill_threshold",
+    "specprefill_keep_pct": "specprefill_keep_pct",
+    "specprefill_backbone_pct": "specprefill_backbone_pct",
+    "specprefill_draft_model": "specprefill_draft_model",
+    "prefix_trie_cache": "prefix_trie_cache",
+    "prefix_trie_cache_size": "prefix_trie_cache_size",
+    "prefix_trie_cache_memory_mb": "prefix_trie_cache_memory_mb",
+    "gpu_memory_utilization": "gpu_memory_utilization",
+    "mllm_draft_model": "mllm_draft_model",
+    "mllm_draft_kind": "mllm_draft_kind",
+    "mllm_draft_block_size": "mllm_draft_block_size",
+    "default_mllm_draft": "default_mllm_draft",
+    "reasoning_parser": "reasoning_parser",
+    "tool_call_parser": "tool_call_parser",
+    "enable_auto_tool_choice": "enable_auto_tool_choice",
+}
+# Spec fields that are identity/bookkeeping, never an entry's business.
+_SPEC_IDENTITY = frozenset({"model_key", "model_path"})
+
+# Keys that name the model rather than configure it.
+ENTRY_META_KEYS = frozenset(
+    {"name", "path", "source", "model", "preload", "estimated_memory_gb"}
+)
+
+
+
+@dataclass(frozen=True)
+class RegistryRequestDefaults:
+    """One entry's request-time defaults, mirroring serve <model>'s globals."""
+
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    presence_penalty: float | None = None
+    repetition_penalty: float | None = None
+    max_tokens: int | None = None
+    max_request_tokens: int | None = None
+    chat_template_kwargs: dict[str, object] | None = None
+    thinking_token_budget: int | None = None
+    timeout: float | None = None
+
+
+def _serve_dests() -> dict[str, bool]:
+    """Serve subparser dest -> True when it is a store_true switch.
+
+    Imported lazily: cli imports this module from inside serve_command().
+    """
+    from .cli import create_parser
+
+    parser = create_parser()
+    for action in parser._subparsers._group_actions:  # noqa: SLF001 - argparse
+        if getattr(action, "choices", None) and "serve" in action.choices:
+            serve = action.choices["serve"]
+            return {
+                a.dest: isinstance(a, argparse._StoreTrueAction)
+                for a in serve._actions
+                if a.dest != "help"
+            }
+    raise RuntimeError("serve subparser not found")
+
+
+def _engine_params() -> set[str]:
+    """Keyword names both engines accept, i.e. what _build_engine may pass."""
+    import inspect
+
+    from .engine.batched import BatchedEngine
+    from .engine.simple import SimpleEngine
+
+    def names(cls: type) -> set[str]:
+        return {
+            name
+            for name, param in inspect.signature(cls.__init__).parameters.items()
+            if param.kind
+            in (param.POSITIONAL_OR_KEYWORD, param.KEYWORD_ONLY)
+            and name != "self"
+        }
+
+    return names(SimpleEngine) | names(BatchedEngine)
+
+
+def entry_contract() -> dict[str, dict[str, Any]]:
+    """The three sinks' live key sets, derived from the objects themselves.
+
+    ``spec`` is ModelSpec fields the engines actually take (what _build_engine
+    forwards), so a ModelSpec field that is bookkeeping (``max_tokens`` is
+    read from the server globals, not from the spec) cannot masquerade as an
+    engine input. ``request`` is the serve dests that name a request-time
+    default, crossed with the field the resolvers read.
+    """
+    scheduler = {f.name: f.type for f in dataclasses.fields(SchedulerConfig)}
+    engine_params = _engine_params()
+    derived = set(_SPEC_FROM_CONFIG) | _SPEC_IDENTITY
+    spec = {
+        f.name: f.type
+        for f in dataclasses.fields(ModelSpec)
+        if f.name in engine_params and f.name not in derived
+    }
+    typed = {f.name: f.type for f in dataclasses.fields(RegisteredModel)}
+    defaults = RegistryRequestDefaults.__annotations__
+    request_fields = ChatCompletionRequest.model_fields
+    request: dict[str, Any] = {}
+    # max_request_tokens is the one request-time default with no request-model
+    # field: a client sends max_tokens, which is checked against this ceiling.
+    request["max_request_tokens"] = defaults["max_request_tokens"]
+    for dest in _serve_dests():
+        if dest in typed or dest in ENTRY_ALIASES or dest in _ENTRY_NEGATED:
+            continue
+        short = dest.removeprefix("default_")
+        if short in defaults and short in request_fields:
+            request[dest] = defaults[short]
+    return {
+        "typed": typed,
+        "scheduler": scheduler,
+        "spec": spec,
+        "request": request,
+    }
+
+
+def _coerce(entry_name: str, key: str, value: object, hint: Any) -> Any:
+    """Validate one value against the annotation of the field it feeds."""
+    try:
+        return TypeAdapter(hint).validate_python(value)
+    except Exception as exc:  # pydantic raises several subclasses
+        raise ValueError(
+            f"models-config entry '{entry_name}': {key}={value!r} is not valid "
+            f"for type {hint}: {exc}"
+        ) from None
+
+
+def _sinks_for(
+    key: str, contract: dict[str, dict[str, Any]], typed_names: set[str]
+) -> list[tuple[str, str, Any]]:
+    """Route one entry key to every sink that consumes it.
+
+    Several keys feed two sinks at once: prefill_step_size is a SchedulerConfig
+    field and an engine argument, mllm_draft_model is an engine argument and a
+    ModelSpec field, enable_mtp is a SchedulerConfig field and SimpleEngine's
+    mtp. Routing to one would leave the other silently at its default.
+    """
+    name = ENTRY_ALIASES.get(key, key)
+    if name in typed_names:
+        # A typed field (including an aliased one: mllm -> force_mllm) carries
+        # its own validation in load_registry_config.
+        return []
+    routed: list[tuple[str, str, Any]] = []
+    if key in _ENTRY_NEGATED:
+        positive = _ENTRY_NEGATED[key]
+        if positive in contract["scheduler"]:
+            routed.append(("scheduler", positive, contract["scheduler"][positive]))
+        return routed
+    if name in contract["scheduler"]:
+        routed.append(("scheduler", name, contract["scheduler"][name]))
+    if name in contract["spec"]:
+        routed.append(("spec", name, contract["spec"][name]))
+    if key in contract["request"]:
+        routed.append(
+            ("request", key.removeprefix("default_"), contract["request"][key])
+        )
+    return routed
+
+
 @dataclass(frozen=True)
 class RegistryServeDefaults:
     """Global serve defaults inherited by registry entries."""
@@ -180,6 +392,13 @@ class RegisteredModel:
     tool_call_parser: str | None = None
     enable_auto_tool_choice: bool | None = None
     cache_memory_mb: int | None = None
+    # SchedulerConfig fields as {field: value}; applied to this entry's own
+    # clone with dataclasses.replace, so the scheduler validates them.
+    scheduler: dict[str, Any] = dataclasses.field(default_factory=dict)
+    # Request-time defaults (server.py's per-request globals).
+    request_defaults: "RegistryRequestDefaults | None" = None
+    # ModelSpec fields with no dedicated field above, passed to _build_engine.
+    spec_overrides: dict[str, Any] = dataclasses.field(default_factory=dict)
 
 @dataclass(frozen=True)
 class ResolvedModelConfig:
@@ -691,6 +910,10 @@ def load_registry_config(
     )
 
     registry: dict[str, RegisteredModel] = {}
+    # Derived once, not per entry: the routing contract and the serve dests.
+    contract = entry_contract()
+    typed_names = set(contract["typed"])
+    serve_dests = _serve_dests()
     for item in models:
         if not isinstance(item, dict):
             raise ValueError(f"Invalid model entry: {item!r}")
@@ -825,9 +1048,89 @@ def load_registry_config(
                 "support MLLM draft models yet)"
             )
 
+        scheduler_bag: dict[str, Any] = {}
+        spec_bag: dict[str, Any] = {}
+        request_bag: dict[str, Any] = {}
+        for key, value in item.items():
+            if key in ENTRY_META_KEYS or ENTRY_ALIASES.get(key, key) in typed_names:
+                continue
+            routed = _sinks_for(key, contract, typed_names)
+            raw = not bool(value) if key in _ENTRY_NEGATED else value
+            for sink, field_name, hint in routed:
+                coerced = _coerce(name, key, raw, hint)
+                if sink == "scheduler":
+                    # Record every value the entry wrote, including False: the
+                    # loop only visits keys the entry actually set, so present-
+                    # and-false is distinguishable from absent, and dropping a
+                    # false would make disable_prefix_cache: true a silent no-op.
+                    scheduler_bag[field_name] = coerced
+                elif sink == "spec":
+                    spec_bag[field_name] = coerced
+                else:
+                    request_bag[field_name] = coerced
+
+        # Anything left over is either a typo or a serve flag with one value
+        # for the whole process. Both are refused; the wording distinguishes
+        # them and the suggestion list comes from the sinks, not a flag table.
+        known = (
+            typed_names
+            | set(ENTRY_META_KEYS)
+            | set(ENTRY_ALIASES)
+            | set(_ENTRY_NEGATED)
+            | set(contract["scheduler"])
+            | set(contract["spec"])
+            | set(contract["request"])
+        )
+        unknown = sorted(
+            key
+            for key in item
+            if key not in known and key not in {"estimated_memory_bytes", "manager",
+                                                "estimated_memory_gb"}
+        )
+        process_wide = [key for key in unknown if key in serve_dests]
+        typos = [key for key in unknown if key not in serve_dests]
+        if typos:
+            suggestions = {
+                key: difflib.get_close_matches(key, sorted(known), n=1)
+                for key in typos
+            }
+            hints = " ".join(
+                f"Did you mean '{match[0]}' instead of '{key}'?"
+                for key, match in suggestions.items()
+                if match
+            )
+            raise ValueError(
+                f"models-config entry '{name}': unknown key(s) {typos}. {hints}".strip()
+            )
+        if process_wide:
+            raise ValueError(
+                f"models-config entry '{name}': {process_wide} set the whole "
+                "server (one host, one port, one auth surface, one download "
+                "config), so they cannot be per-entry. Set them on the serve "
+                "command line instead; an entry may only set SchedulerConfig "
+                "fields, engine fields, and request defaults."
+            )
+
+        # Same invariant the single-model path enforces in load_model(): the
+        # default output budget can never exceed the per-request ceiling.
+        if (
+            request_bag.get("max_tokens") is not None
+            and request_bag.get("max_request_tokens") is not None
+            and request_bag["max_tokens"] > request_bag["max_request_tokens"]
+        ):
+            raise ValueError(
+                f"models-config entry {name!r}: max_tokens ({request_bag['max_tokens']}) "
+                f"cannot exceed max_request_tokens ({request_bag['max_request_tokens']})"
+            )
+
         registry[name] = RegisteredModel(
             name=name,
             source=str(source),
+            scheduler=scheduler_bag,
+            request_defaults=(
+                RegistryRequestDefaults(**request_bag) if request_bag else None
+            ),
+            spec_overrides=spec_bag,
             preload=bool(item.get("preload", False)),
             continuous_batching=item.get("continuous_batching"),
             force_mllm=item.get("mllm"),
@@ -893,6 +1196,11 @@ class ModelManager:
 
     def has_model(self, model_name: str) -> bool:
         return model_name in self._registry
+
+    def request_defaults(self, model_name: str) -> "RegistryRequestDefaults | None":
+        """The entry's request-time defaults, or None (single-model serve)."""
+        entry = self._registry.get(model_name)
+        return entry.request_defaults if entry is not None else None
 
     def list_models(self) -> list[dict[str, Any]]:
         """Return registry state for /v1/models."""
@@ -1401,46 +1709,25 @@ class ModelManager:
 
         if self._engine_factory is not None:
             engine = self._engine_factory(config)
-        elif config.continuous_batching:
-            engine = BatchedEngine(
-                model_name=config.resolved_source,
-                scheduler_config=config.scheduler_config,
-                stream_interval=config.stream_interval,
-                force_mllm=config.force_mllm,
-                gpu_memory_utilization=config.gpu_memory_utilization,
-                mllm_draft_model=config.mllm_draft_model,
-                mllm_draft_kind=config.mllm_draft_kind,
-                mllm_draft_block_size=config.mllm_draft_block_size,
-                default_mllm_draft=config.default_mllm_draft,
-                specprefill_enabled=config.specprefill_enabled,
-                specprefill_threshold=config.specprefill_threshold,
-                specprefill_keep_pct=config.specprefill_keep_pct,
-                specprefill_backbone_pct=config.specprefill_backbone_pct,
-                specprefill_draft_model=config.specprefill_draft_model,
-                reasoning_parser_name=config.reasoning_parser,
-                tool_call_parser_name=config.tool_call_parser,
-                auto_tool_choice=config.enable_auto_tool_choice,
-            )
         else:
-            engine = SimpleEngine(
-                model_name=config.resolved_source,
-                force_mllm=config.force_mllm,
-                mtp=config.enable_mtp,
-                prefill_step_size=config.prefill_step_size,
-                specprefill_enabled=config.specprefill_enabled,
-                specprefill_threshold=config.specprefill_threshold,
-                specprefill_keep_pct=config.specprefill_keep_pct,
-                specprefill_backbone_pct=config.specprefill_backbone_pct,
-                specprefill_draft_model=config.specprefill_draft_model,
-                mllm_draft_model=config.mllm_draft_model,
-                mllm_draft_kind=config.mllm_draft_kind,
-                mllm_draft_block_size=config.mllm_draft_block_size,
-                default_mllm_draft=config.default_mllm_draft,
-                prefix_trie_cache=config.prefix_trie_cache,
-                prefix_trie_cache_memory_mb=config.prefix_trie_cache_memory_mb,
-                reasoning_parser_name=config.reasoning_parser,
-                tool_call_parser_name=config.tool_call_parser,
-                auto_tool_choice=config.enable_auto_tool_choice,
+            # One construction path for both serving modes: the same function
+            # the single-model path installs as its residency engine factory.
+            # A registry entry therefore cannot drift from `serve <model>` in
+            # which engine argument it passes.
+            from .server import ModelSpec, _build_engine
+
+            engine = _build_engine(
+                ModelSpec(
+                    model_key=config.entry.name,
+                    **{
+                        spec_field: getattr(config, config_attr)
+                        for spec_field, config_attr in _SPEC_FROM_CONFIG.items()
+                    },
+                    # ModelSpec fields an entry can set that have no dedicated
+                    # RegisteredModel field (today: trust_remote_code). Kept as
+                    # a dict so a future ModelSpec field needs no code here.
+                    **config.entry.spec_overrides,
+                )
             )
 
         await engine.start()
@@ -1540,6 +1827,21 @@ class ModelManager:
         # never shared with another entry, so the in-place set is safe.
         if entry.cache_memory_mb is not None and scheduler_config is not None:
             scheduler_config.cache_memory_mb = entry.cache_memory_mb
+        if entry.scheduler:
+            if scheduler_config is None:
+                raise ValueError(
+                    f"models-config entry '{entry.name}': "
+                    f"{sorted(entry.scheduler)} are SchedulerConfig fields and "
+                    "need continuous_batching: true (a simple-mode engine takes "
+                    "no SchedulerConfig)"
+                )
+            # replace() re-runs __post_init__, so the scheduler validates these
+            # exactly as it validates the CLI's own flags.
+            scheduler_config = dataclasses.replace(scheduler_config, **entry.scheduler)
+        if scheduler_config is not None:
+            # BatchedEngine reads MTP from its SchedulerConfig; only SimpleEngine
+            # takes mtp= as a constructor argument.
+            scheduler_config.enable_mtp = enable_mtp
         specprefill_enabled = (
             entry.specprefill_enabled
             if entry.specprefill_enabled is not None

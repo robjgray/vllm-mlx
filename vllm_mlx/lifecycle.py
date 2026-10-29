@@ -47,6 +47,18 @@ class ModelSpec:
     prefix_trie_cache_memory_mb: int | None = None
     # Resolved local snapshot for ``model_name``; loading only, not identity.
     model_path: str | None = None
+    # Engine-construction fields a registry entry may set per model. Defaults
+    # mirror the engines' own signatures so a spec built without them (the
+    # single-model lazy-load path) constructs the same engine as before.
+    trust_remote_code: bool = False
+    gpu_memory_utilization: float = 0.90
+    mllm_draft_model: str | None = None
+    mllm_draft_kind: str | None = None
+    mllm_draft_block_size: int | None = None
+    default_mllm_draft: bool = False
+    reasoning_parser: str | None = None
+    tool_call_parser: str | None = None
+    enable_auto_tool_choice: bool = False
 
 
 @dataclass
