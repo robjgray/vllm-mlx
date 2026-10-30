@@ -232,6 +232,11 @@ class BatchedEngine(BaseEngine):
         self._reasoning_parser_name = reasoning_parser_name
         self._tool_call_parser_name = tool_call_parser_name
         self._auto_tool_choice = auto_tool_choice
+        # server.py reads these via getattr(engine, 'tool_call_parser_name' /
+        # 'auto_tool_choice') — expose the public names or per-entry overrides
+        # silently fall back and the request never parses tool calls.
+        self.tool_call_parser_name = tool_call_parser_name
+        self.auto_tool_choice = auto_tool_choice
         self._is_mllm = force_mllm or is_mllm_model(self._model_path)
 
         self._model = None

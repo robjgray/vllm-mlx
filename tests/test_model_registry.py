@@ -2120,3 +2120,19 @@ def test_request_defaults_contextvar_resets_between_requests():
     server._REQUEST_DEFAULTS.set(None)
     assert server.current_request_defaults() is None
     _ = contextvars  # silence linters if unused above
+
+
+def test_engine_exposes_public_parser_attrs_for_server_getattr(tmp_path):
+    """server.py reads per-entry parsers via getattr(engine, 'tool_call_parser_name'
+    / 'auto_tool_choice') — the engines must expose those exact public names."""
+    from vllm_mlx.engine.batched import BatchedEngine
+    from vllm_mlx.engine.simple import SimpleEngine
+
+    b = BatchedEngine.__new__(BatchedEngine)
+    b.__init__.__wrapped__ if hasattr(b.__init__, "__wrapped__") else None
+    # call the real __init__ with stubs is heavy; instead assert the class sets them
+    import inspect
+    src_b = inspect.getsource(BatchedEngine.__init__)
+    src_s = inspect.getsource(SimpleEngine.__init__)
+    assert "self.tool_call_parser_name" in src_b and "self.auto_tool_choice" in src_b
+    assert "self.tool_call_parser_name" in src_s and "self.auto_tool_choice" in src_s

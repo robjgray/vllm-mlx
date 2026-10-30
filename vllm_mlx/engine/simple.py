@@ -266,6 +266,9 @@ class SimpleEngine(BaseEngine):
         self._reasoning_parser_name = reasoning_parser_name
         self._tool_call_parser_name = tool_call_parser_name
         self._auto_tool_choice = auto_tool_choice
+        # public names read by server.py via getattr(engine, ...) per-entry overrides
+        self.tool_call_parser_name = tool_call_parser_name
+        self.auto_tool_choice = auto_tool_choice
         # KV cache size limit
         self._max_kv_size = max_kv_size
 
