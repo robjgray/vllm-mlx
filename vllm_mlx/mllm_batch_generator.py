@@ -3309,10 +3309,20 @@ def install_mtp_mllm(
                 # shorter valid KV length than the rows already decoding; the
                 # mlx-vlm helper drafts those rows independently and restores
                 # the batched shared-KV view afterwards.
+                # The drafter consumes the target's FINAL hidden state. The
+                # model's return_hidden capture is the pre-final-norm tensor
+                # (mlx_vlm's gemma4 text model appends it to hidden_sink before
+                # its last RMSNorm), and mlx_vlm's own non-batched assistant
+                # path normalizes it via _mtp_draft_hidden before handing it to
+                # the drafter. Normalize here, at the single point where the
+                # hidden reaches the external drafter, so both paths agree.
+                from mlx_vlm.speculative.mtp import _mtp_draft_hidden
+
+                draft_hidden = _mtp_draft_hidden(language_model, hidden_states)
                 draft_tokens = _draft_external_mtp_active_batch(
                     draft_model,
                     primary_tokens,
-                    hidden_states,
+                    draft_hidden,
                     positions,
                     _draft_sampler,
                 )
