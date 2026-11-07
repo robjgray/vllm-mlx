@@ -3164,6 +3164,22 @@ def install_mtp_mllm(
         # distributions and UID-keyed verified state.
         prefill_bypass = input_tokens.shape[1] > 1
         no_active_batch_bypass = batch_gen.active_batch is None
+        # B==1 under CB: MTP is pure overhead (ledger #46/#50 measured parity
+        # only with MTP bypassed). Run the plain width-1 step.
+        # B==1 under CB: MTP is pure overhead (ledger #46/#50 measured parity
+        # only with MTP bypassed). Enable via config flag mllm_mtp_b1_bypass.
+        # batch_gen has no .config attr; the scheduler's config is the source of
+        # truth — read it from the module-level scheduler hook if present.
+        _b1 = getattr(batch_gen, "mtp_b1_bypass", None)
+        if _b1 is None:
+            sched = getattr(batch_gen, "_scheduler", None)
+            _b1 = bool(getattr(getattr(sched, "config", None), "mllm_mtp_b1_bypass", False)) if sched is not None else False
+        single_row_bypass = (
+            _b1
+            and input_tokens.shape[1] == 1
+            and batch_gen.active_batch is not None
+            and len(batch_gen.active_batch.uids) == 1
+        )
         logits_processors_bypass = logits_processors is not None and any(
             logits_processors
         )
@@ -3181,6 +3197,7 @@ def install_mtp_mllm(
             or no_active_batch_bypass
             or logits_processors_bypass
             or assistant_not_requested_bypass
+         or single_row_bypass
         ):
             # Keep the descriptions near the guards so operator-facing
             # telemetry stays dynamic instead of duplicating code predicates:
@@ -3197,6 +3214,8 @@ def install_mtp_mllm(
                     _bypass_counts["logits_processors"] += 1
                 if assistant_not_requested_bypass:
                     _bypass_counts["assistant_not_requested"] += 1
+                if single_row_bypass:
+                    _bypass_counts["concurrent_batch"] += 1
             _skip_state_by_uid.clear()
             original_step_kwargs = (
                 {"rope_deltas": rope_deltas} if rope_deltas is not None else {}

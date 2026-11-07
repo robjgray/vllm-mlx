@@ -71,6 +71,9 @@ class MLLMSchedulerConfig:
     max_video_frames: int = 128
     # Enable MTP speculative decoding
     enable_mtp: bool = False
+    # Bypass MTP (draft+verify) when the active batch is a single request:
+    # measured never-slower (ledger #46/#50, ratio 1.00 = parity at B==1).
+    mllm_mtp_b1_bypass: bool = True
     # Number of draft tokens for MTP
     mtp_num_draft_tokens: int = 1
     # Enable KV prefix cache for text-only requests
@@ -388,6 +391,7 @@ class MLLMScheduler:
                     )
                 from .mllm_batch_generator import install_mtp_mllm
 
+                self.batch_generator._scheduler = self  # for config flags in gen
                 install_mtp_mllm(
                     self.batch_generator,
                     self.batch_generator.language_model,
