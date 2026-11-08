@@ -3472,10 +3472,33 @@ def install_mtp_mllm(
             verify_input = mx.concatenate(
                 [primary_tokens[:, None], draft_tokens[:, None]], axis=1
             )
-            verify_output = language_model(
-                verify_input, cache=cache, return_hidden=True, **model_kwargs
-            )
-            verify_logits, verify_hidden = _model_parts(verify_output)
+            _pipe = os.environ.get("VLLM_MLX_MTP_PIPELINE2") == "1"
+            if _pipe and batch_size >= 8 and not prefill_bypass and rope_deltas is not None:
+                # Ledger #80: like #79's two-group interleave, but the rope
+                # offset tensor is sliced PER GROUP from the global per-lane
+                # tensor (shape == per-group lane count), fixing #79's
+                # B=16 rope-offset break (global slice gave shape 11/13 vs 5/6).
+                half = batch_size // 2
+                _i_a = mx.arange(0, half)
+                _i_b = mx.arange(half, batch_size)
+                rd_a = rope_deltas[_i_a] if rope_deltas.shape[0] == batch_size else rope_deltas
+                rd_b = rope_deltas[_i_b] if rope_deltas.shape[0] == batch_size else rope_deltas
+                va, vb = verify_input[_i_a], verify_input[_i_b]
+                out_a = language_model(va, cache=cache, return_hidden=True, rope_deltas=rd_a)
+                out_b = language_model(vb, cache=cache, return_hidden=True, rope_deltas=rd_b)
+                logits_a, hidden_a = _model_parts(out_a)
+                logits_b, hidden_b = _model_parts(out_b)
+                verify_logits = mx.concatenate([logits_a, logits_b], axis=0)
+                verify_hidden = (
+                    mx.concatenate([hidden_a, hidden_b], axis=0)
+                    if hidden_a is not None and hidden_b is not None
+                    else None
+                )
+            else:
+                verify_output = language_model(
+                    verify_input, cache=cache, return_hidden=True, **model_kwargs
+                )
+                verify_logits, verify_hidden = _model_parts(verify_output)
 
             # Verify in each request's sampler space. The old argmax equality
             # check was valid only for greedy decoding and silently bypassed
