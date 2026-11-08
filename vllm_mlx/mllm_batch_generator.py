@@ -2928,6 +2928,69 @@ def _iter_cache_leaves(caches: List[Any]) -> List[Any]:
     return leaves
 
 
+def _temporal_kv_view(layer_cache: Any, keys: Any, values: Any) -> Tuple[Any, Any]:
+    """Return (keys, values) in temporal order without mutating the cache.
+
+    Ledger #72: once a rotating ring has wrapped, its buffers hold the oldest
+    columns in the middle. The batch variants used under continuous batching
+    are not subclasses of RotatingKVCache, so the mlx-vlm extractor's
+    isinstance gate skips them; the transform here is identical to the plain
+    class's ``_temporal_order`` but copy-based.
+    """
+    idx = getattr(layer_cache, "_idx", None)
+    rotated = getattr(layer_cache, "rotated", False)
+    if rotated is None or rotated is False:
+        # Plain RotatingKVCache marks a wrapped ring via _idx < offset.
+        offset = getattr(layer_cache, "offset", None)
+        rotated = bool(
+            idx is not None
+            and isinstance(offset, int)
+            and idx < offset
+        )
+    if not rotated or idx is None or idx >= keys.shape[2]:
+        return keys, values
+    keep = getattr(layer_cache, "keep", 0) or 0
+
+    def reorder(a):
+        if keep:
+            return mx.concatenate(
+                [a[..., :keep, :], a[..., idx:, :], a[..., keep:idx, :]], axis=2
+            )
+        return mx.concatenate([a[..., idx:, :], a[..., :idx, :]], axis=2)
+
+    return reorder(keys), reorder(values)
+
+
+def _shared_kv_states(language_model: Any, cache: List[Any]) -> Dict[str, Any]:
+    """Shared K/V between target and assistant drafter, temporally ordered.
+
+    Ledger #72: differs from mlx_vlm's _mtp_shared_kv_from_prompt_cache in two
+    ways, both required for continuous batching: shared-KV targets (trailing
+    num_kv_shared_layers) are padded with the None placeholders the model's
+    own forward uses before its layer loop, and rotating-ring state is
+    temporally ordered for batch rotating caches too (the helper's isinstance
+    gate sees only plain RotatingKVCache). Without the padding, a multi-lane
+    CB batch cache (len < len(layers) once shared-KV layers hold no per-batch
+    leaf) makes the helper return {} and the drafter raises
+    "Assistant MTP requires target shared-KV state from the batch cache".
+    """
+    layers = getattr(getattr(language_model, "model", None), "layers", [])
+    padded = list(cache)
+    if len(padded) < len(layers):
+        padded += [None] * (len(layers) - len(padded))
+    shared: Dict[str, Any] = {}
+    for layer, layer_cache in zip(layers, padded):
+        if layer_cache is None or not hasattr(layer_cache, "state"):
+            continue
+        state = layer_cache.state
+        if not state or len(state) < 2 or state[0] is None:
+            continue
+        keys, values = state[0], state[1]
+        keys, values = _temporal_kv_view(layer_cache, keys, values)
+        shared[layer.layer_type] = (keys, values)
+    return shared
+
+
 def _holds_recurrent_state(cache: Any) -> bool:
     """Whether a cache leaf keeps state that appended tokens cannot rewind.
 
@@ -3085,9 +3148,10 @@ def install_mtp_mllm(
         return logits, hidden
 
     def _shared_kv(cache: List[Any]) -> Dict[str, Any]:
-        from mlx_vlm.speculative.mtp import _mtp_shared_kv_from_prompt_cache
-
-        return _mtp_shared_kv_from_prompt_cache(language_model, cache)
+        # Ledger #72: local temporally-ordered extraction (see
+        # _shared_kv_states) — the mlx-vlm helper returns {} for multi-lane
+        # CB batch caches, which is the shared-KV wall.
+        return _shared_kv_states(language_model, cache)
 
     def _cache_positions(cache: List[Any], batch_size: int) -> Tuple[int, List[int]]:
         from mlx_vlm.speculative.mtp import _mtp_cache_positions
