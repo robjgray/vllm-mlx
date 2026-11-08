@@ -3251,6 +3251,17 @@ def install_mtp_mllm(
             getattr(request, "images", None) or getattr(request, "videos", None)
             for request in active_requests
         )
+        # Ledger #78: lanes paused by a reject (one step) do not draft this
+        # step; if ALL active lanes are paused, take the plain path.
+        _paused = getattr(batch_gen, "_reject_paused_uids", set()) or set()
+        _active_uids = set(batch_gen.active_batch.uids) if batch_gen.active_batch else set()
+        _drafting_uids = _active_uids - _paused
+        all_paused_bypass = (
+            os.environ.get("VLLM_MLX_MTP_REJECT_DEFER") == "1"
+            and external_drafter
+            and active_requests
+            and not _drafting_uids
+        )
         assistant_not_requested_bypass = external_drafter and (
             not active_requests
             or not all(request.mllm_draft for request in active_requests)
@@ -3258,6 +3269,7 @@ def install_mtp_mllm(
         )
         if (
             prefill_bypass
+            or all_paused_bypass
             or no_active_batch_bypass
             or logits_processors_bypass
             or assistant_not_requested_bypass
@@ -3294,7 +3306,15 @@ def install_mtp_mllm(
             )
 
         current_uids = list(batch_gen.active_batch.uids)
-        skip_entries = [_skip_state_by_uid.pop(uid, None) for uid in current_uids]
+        # Ledger #78: paused (rejected-last-step) lanes run a full forward this
+        # step and resume drafting from it; clear their pause marker.
+        _paused_now = getattr(batch_gen, "_reject_paused_uids", set()) or set()
+        if _paused_now:
+            batch_gen._reject_paused_uids = set()
+        skip_entries = [
+            None if uid in _paused_now else _skip_state_by_uid.pop(uid, None)
+            for uid in current_uids
+        ]
         if any(skip_entries) and not all(skip_entries):
             # Batch membership changed since skip state was last populated
             # (e.g. a chunked-prefill request finalizing mid-batch). Skip
@@ -3596,7 +3616,43 @@ def install_mtp_mllm(
                         axis=1,
                     )
 
-                if _rnn_snapshots:
+                _reject_defer = os.environ.get("VLLM_MLX_MTP_REJECT_DEFER") == "1"
+                if _reject_defer and not all_accepted:
+                    # Ledger #78: no replay forward. Trim the rejected draft
+                    # (pure-attention path) or restore snapshots (hybrid), set
+                    # skip_state from the verify row-0 (already the correction
+                    # distribution), and mark rejected lanes as paused: they
+                    # emit the correction token now and skip drafting next step.
+                    for c in cache:
+                        if (
+                            hasattr(c, "is_trimmable")
+                            and c.is_trimmable()
+                            and hasattr(c, "trim")
+                        ):
+                            c.trim(1)
+                    for _ci, _snap in _rnn_snapshots.items():
+                        cache[_ci].state = _snap
+                    _deferred_paused = getattr(batch_gen, "_reject_paused_uids", set())
+                    if verify_hidden is not None:
+                        for row, uid in enumerate(current_uids):
+                            if not accepted_rows[row]:
+                                _deferred_paused.add(uid)
+                                _skip_state_by_uid[uid] = {
+                                    "logits": verify_logits[row : row + 1, 0, :],
+                                    "hidden": verify_hidden[row : row + 1, 0:1, :],
+                                }
+                            else:
+                                _skip_state_by_uid[uid] = {
+                                    "logits": verify_logits[row : row + 1, 1, :],
+                                    "hidden": verify_hidden[row : row + 1, -1:, :],
+                                }
+                        batch_gen._reject_paused_uids = _deferred_paused
+                    with _mtp_stats_lock:
+                        _mtp_stats["rejected"] += 1
+                    # handled: skip the whole replay block below
+                    import sys as _sys
+                    _mtp_step_done = True
+                if _rnn_snapshots and not (_reject_defer and not all_accepted):
                     # Hybrid model: undo verify then replay the actual emitted
                     # suffix (primary only, or primary + the per-row emitted token).
                     for c in cache:
@@ -3624,7 +3680,7 @@ def install_mtp_mllm(
                             }
                     else:
                         _skip_state_by_uid.clear()
-                elif _rollback_appended_tokens(cache, 1):
+                elif not (_reject_defer and not all_accepted) and _rollback_appended_tokens(cache, 1):
                     # Pure-attention stack: rewinding the rejected draft leaves
                     # the cache exactly at the verified primary token. Per-row
                     # emitted tokens (residual draws, target wins over drafts)
@@ -3665,7 +3721,7 @@ def install_mtp_mllm(
                             }
                     else:
                         _skip_state_by_uid.clear()
-                else:
+                elif not (_reject_defer and not all_accepted):
                     # Pure attention caches retain primary after trimming the
                     # speculative draft. The emitted suffix is then advanced
                     # explicitly per row; the all-greedy fallback reuses the
