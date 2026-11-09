@@ -3148,9 +3148,21 @@ def install_mtp_mllm(
         return logits, hidden
 
     def _shared_kv(cache: List[Any]) -> Dict[str, Any]:
-        # Ledger #72: local temporally-ordered extraction (see
-        # _shared_kv_states) — the mlx-vlm helper returns {} for multi-lane
-        # CB batch caches, which is the shared-KV wall.
+        # Ledger #72 + phase-0 fix: temporally-ordered extraction, but keep the
+        # mlx-vlm helper's exact len(cache)==len(layers) gate behavior for the
+        # shared dict. The helper returns {} when they differ; our padded view is
+        # only for the drafter's shared_kv, never for cache bookkeeping. To avoid
+        # disturbing prefix-cache store/extract (which key on real cache length),
+        # we only use the padded path when the strict helper returns {} AND every
+        # real leaf is a batch rotating cache (i.e. we are mid-CB-batch).
+        strict = None
+        try:
+            from mlx_vlm.speculative.mtp import _mtp_shared_kv_from_prompt_cache
+            strict = _mtp_shared_kv_from_prompt_cache(language_model, cache)
+        except Exception:
+            strict = None
+        if strict:
+            return strict
         return _shared_kv_states(language_model, cache)
 
     def _cache_positions(cache: List[Any], batch_size: int) -> Tuple[int, List[int]]:
