@@ -3652,6 +3652,10 @@ def install_mtp_mllm(
                     )
 
                 _reject_defer = os.environ.get("VLLM_MLX_MTP_REJECT_DEFER") == "1"
+                if _reject_defer and not all_accepted and "accepted_rows" not in locals():
+                    # Stochastic-sampled reject path has no per-row accepted_rows;
+                    # every row in emitted_by_uid is a reject there by construction.
+                    accepted_rows = [uid not in emitted_by_uid for uid in current_uids]
                 if _reject_defer and not all_accepted:
                     # Ledger #78: no replay forward. Trim the rejected draft
                     # (pure-attention path) or restore snapshots (hybrid), set
