@@ -3662,13 +3662,21 @@ def install_mtp_mllm(
                     # skip_state from the verify row-0 (already the correction
                     # distribution), and mark rejected lanes as paused: they
                     # emit the correction token now and skip drafting next step.
-                    for c in cache:
-                        if (
-                            hasattr(c, "is_trimmable")
-                            and c.is_trimmable()
-                            and hasattr(c, "trim")
-                        ):
-                            c.trim(1)
+                    # Reject-defer must leave the cache exactly at the accepted
+                    # primary token, like the replay path's rollback does. Plain
+                    # trim is only exact while a ring cache is unwrapped; once the
+                    # sliding window has wrapped, trim moves cursors but leaves the
+                    # rejected draft columns in the physical ring (phantom keys on
+                    # the next temporal reorder). Fall back to the splice-based
+                    # rollback for those.
+                    if not _rollback_appended_tokens(cache, 1):
+                        for c in cache:
+                            if (
+                                hasattr(c, "is_trimmable")
+                                and c.is_trimmable()
+                                and hasattr(c, "trim")
+                            ):
+                                c.trim(1)
                     for _ci, _snap in _rnn_snapshots.items():
                         cache[_ci].state = _snap
                     _deferred_paused = getattr(batch_gen, "_reject_paused_uids", set())
