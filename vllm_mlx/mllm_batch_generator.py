@@ -3250,6 +3250,12 @@ def install_mtp_mllm(
         if _b1 is None:
             sched = getattr(batch_gen, "_scheduler", None)
             _b1 = bool(getattr(getattr(sched, "config", None), "mllm_mtp_b1_bypass", False)) if sched is not None else False
+        # Operator override, matching the other MTP toggles (REJECT_DEFER,
+        # PIPELINE2): the env var wins over the scheduler config so one server
+        # build can serve either the bypassed or the live B=1 MTP path.
+        _b1_env = os.environ.get("VLLM_MLX_MTP_B1_BYPASS")
+        if _b1_env in ("0", "1"):
+            _b1 = _b1_env == "1"
         single_row_bypass = (
             _b1
             and input_tokens.shape[1] == 1
