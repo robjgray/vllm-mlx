@@ -3695,10 +3695,12 @@ def install_mtp_mllm(
                     for _ci, _snap in _rnn_snapshots.items():
                         cache[_ci].state = _snap
                     _deferred_paused = getattr(batch_gen, "_reject_paused_uids", set())
+                    _resume = os.environ.get("VLLM_MLX_MTP_RESUME_REJECT") == "1"
                     if verify_hidden is not None:
                         for row, uid in enumerate(current_uids):
                             if not accepted_rows[row]:
-                                _deferred_paused.add(uid)
+                                if not _resume:
+                                    _deferred_paused.add(uid)
                                 _skip_state_by_uid[uid] = {
                                     "logits": verify_logits[row : row + 1, 0, :],
                                     "hidden": verify_hidden[row : row + 1, 0:1, :],
