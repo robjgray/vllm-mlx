@@ -3310,6 +3310,15 @@ def install_mtp_mllm(
                     _bypass_counts["assistant_not_requested"] += 1
                 if single_row_bypass:
                     _bypass_counts["concurrent_batch"] += 1
+            if all_paused_bypass and os.environ.get("VLLM_MLX_MTP_B1_RESUME") == "1":
+                # Ledger #13: a deferred reject pauses speculation for ONE
+                # step. At B==1 the paused lane is the only lane in the batch,
+                # so this plain-path bypass was taken -- and the pause marker
+                # was never cleared, so every later step took the bypass too
+                # and the request never drafted again (measured: 11 attempts
+                # then 43 plain steps for a 64-token request). Clear the marker
+                # so the lane resumes drafting on the next step.
+                batch_gen._reject_paused_uids = set()
             _skip_state_by_uid.clear()
             original_step_kwargs = (
                 {"rope_deltas": rope_deltas} if rope_deltas is not None else {}
