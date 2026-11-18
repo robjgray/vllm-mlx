@@ -1725,7 +1725,6 @@ class TestMLLMBatchGeneratorMTPGuards:
         assert stats["bypass_counts"] == {
             "prefill": 0,
             "no_active_batch": 0,
-            "concurrent_batch": 0,
             "multi_lane": 0,
             "logits_processors": 0,
             "assistant_not_requested": 0,
@@ -2511,7 +2510,6 @@ class TestMLLMBatchGeneratorMTPGuards:
         from vllm_mlx.mllm_batch_generator import install_mtp_mllm
 
         monkeypatch.setenv("VLLM_MLX_MTP_REJECT_DEFER", "1")
-        monkeypatch.setenv("VLLM_MLX_MTP_B1_BYPASS", "0")
         # Pin the resume path OFF explicitly rather than relying on a default:
         # the branch defaults the flag ON, and this test exercises the pause
         # branch, which is the path taken when the lane does NOT resume.
@@ -4851,7 +4849,6 @@ class TestDeepDraftChain:
 
         monkeypatch.setenv("VLLM_MLX_MTP_REJECT_DEFER", "1")
         monkeypatch.setenv("VLLM_MLX_MTP_RESUME_REJECT", "1")
-        monkeypatch.setenv("VLLM_MLX_MTP_B1_BYPASS", "0")
         monkeypatch.setenv("VLLM_MLX_MTP_DRAFT_DEPTH", str(depth))
         if native:
             monkeypatch.setenv("VLLM_MLX_MTP_NATIVE_STEP", "1")
@@ -5161,7 +5158,6 @@ class TestDeepDraftRingRollback:
 
         monkeypatch.setenv("VLLM_MLX_MTP_REJECT_DEFER", "1")
         monkeypatch.setenv("VLLM_MLX_MTP_RESUME_REJECT", "1")
-        monkeypatch.setenv("VLLM_MLX_MTP_B1_BYPASS", "0")
         monkeypatch.setenv("VLLM_MLX_MTP_DRAFT_DEPTH", str(depth))
 
         monkeypatch.setattr(
@@ -5459,7 +5455,6 @@ class TestMLLMLogprobs:
             install_mtp_mllm,
         )
 
-        monkeypatch.delenv("VLLM_MLX_MTP_B1_BYPASS", raising=False)
         monkeypatch.delenv("VLLM_MLX_MTP_REJECT_DEFER", raising=False)
 
         class LanguageModel:
@@ -5729,7 +5724,6 @@ class TestBranchDefaults:
         for name in self.FLAGS:
             monkeypatch.delenv(name, raising=False)
         monkeypatch.delenv("VLLM_MLX_MTP_DRAFT_DEPTH", raising=False)
-        monkeypatch.delenv("VLLM_MLX_MTP_B1_BYPASS", raising=False)
 
     def test_flags_default_on_and_the_env_var_overrides(self, monkeypatch):
         from vllm_mlx.mllm_batch_generator import _mtp_flag
@@ -5765,7 +5759,3 @@ class TestBranchDefaults:
         # The deep-drafting default (K=2), not the shipped single draft.
         assert batch_gen.get_mtp_stats()["effective_draft_tokens"] == 2
 
-    def test_the_static_b1_switch_is_off_by_default(self):
-        from vllm_mlx.mllm_scheduler import MLLMSchedulerConfig
-
-        assert MLLMSchedulerConfig().mllm_mtp_b1_bypass is False

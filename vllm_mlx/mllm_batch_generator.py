@@ -3524,7 +3524,6 @@ def install_mtp_mllm(
     _bypass_counts = {
         "prefill": 0,
         "no_active_batch": 0,
-        "concurrent_batch": 0,
         "multi_lane": 0,
         "logits_processors": 0,
         "assistant_not_requested": 0,
@@ -3631,28 +3630,6 @@ def install_mtp_mllm(
         # distributions and UID-keyed verified state.
         prefill_bypass = input_tokens.shape[1] > 1
         no_active_batch_bypass = batch_gen.active_batch is None
-        # B==1 under CB: MTP is pure overhead (ledger #46/#50 measured parity
-        # only with MTP bypassed). Run the plain width-1 step.
-        # B==1 under CB: MTP is pure overhead (ledger #46/#50 measured parity
-        # only with MTP bypassed). Enable via config flag mllm_mtp_b1_bypass.
-        # batch_gen has no .config attr; the scheduler's config is the source of
-        # truth — read it from the module-level scheduler hook if present.
-        _b1 = getattr(batch_gen, "mtp_b1_bypass", None)
-        if _b1 is None:
-            sched = getattr(batch_gen, "_scheduler", None)
-            _b1 = bool(getattr(getattr(sched, "config", None), "mllm_mtp_b1_bypass", False)) if sched is not None else False
-        # Operator override, matching the other MTP toggles (REJECT_DEFER,
-        # PIPELINE2): the env var wins over the scheduler config so one server
-        # build can serve either the bypassed or the live B=1 MTP path.
-        _b1_env = os.environ.get("VLLM_MLX_MTP_B1_BYPASS")
-        if _b1_env in ("0", "1"):
-            _b1 = _b1_env == "1"
-        single_row_bypass = (
-            _b1
-            and input_tokens.shape[1] == 1
-            and batch_gen.active_batch is not None
-            and len(batch_gen.active_batch.uids) == 1
-        )
         # Never-slower floor (VLLM_MLX_MTP_SINGLE_LANE_ONLY=1, default off).
         # The accept decision is BATCH-WIDE: one lane's reject rolls the draft
         # column out of EVERY lane and the accepted lanes never emit their
@@ -3719,7 +3696,6 @@ def install_mtp_mllm(
             or no_active_batch_bypass
             or logits_processors_bypass
             or assistant_not_requested_bypass
-         or single_row_bypass
          or multi_lane_bypass
          or _gate_bypass
         ):
@@ -3738,8 +3714,6 @@ def install_mtp_mllm(
                     _bypass_counts["logits_processors"] += 1
                 if assistant_not_requested_bypass:
                     _bypass_counts["assistant_not_requested"] += 1
-                if single_row_bypass:
-                    _bypass_counts["concurrent_batch"] += 1
                 if multi_lane_bypass:
                     _bypass_counts["multi_lane"] += 1
                 if _gate_bypass:
