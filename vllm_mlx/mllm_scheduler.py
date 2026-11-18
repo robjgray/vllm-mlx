@@ -45,6 +45,78 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _token_text(tokenizer: Any, token_id: int) -> str:
+    """Return the printable text of one token id."""
+    decode = getattr(tokenizer, "decode", None)
+    if decode is None:
+        return str(token_id)
+    try:
+        text = decode([token_id])
+    except Exception:  # pragma: no cover - tokenizer specific
+        return str(token_id)
+    return text if isinstance(text, str) else str(token_id)
+
+
+def _token_logprob_entry(
+    logprobs: Any,
+    token_id: int,
+    top_n: int,
+    tokenizer: Any,
+) -> Optional[dict]:
+    """Build an OpenAI-compatible logprob entry for one emitted token.
+
+    ``logprobs`` is the log-probability row the token was actually sampled
+    from -- the row of the forward that produced it. In the MTP path that is
+    the primary forward's row, the width-2 verify's row 0 (the accepted
+    draft) or its row 1 (the token after it), so the reported gap always
+    belongs to the row that produced the token.
+
+    The entry carries the sampled token's own logprob plus the ``top_n``
+    most likely alternatives, which is what a client needs to compute the
+    top1-top2 gap.
+    """
+    if logprobs is None:
+        return None
+    row = logprobs
+    if getattr(row, "ndim", 1) != 1:
+        row = row.reshape(-1)
+    size = int(row.size)
+    if size <= 1 or not (0 <= int(token_id) < size):
+        return None
+    count = int(top_n or 0)
+    sampled = row[int(token_id)]
+    top = []
+    if count > 0:
+        count = min(count, size - 1)
+        # argpartition is O(n); a full sort of the vocabulary per token is not.
+        partition = mx.argpartition(row, kth=-count, axis=-1)
+        candidates = partition[-count:]
+        values = mx.take_along_axis(row, candidates, axis=-1)
+        order = mx.argsort(-values, axis=-1)
+        candidates = candidates[order]
+        values = values[order]
+        mx.eval(candidates, values)
+        for candidate, value in zip(candidates.tolist(), values.tolist()):
+            text = _token_text(tokenizer, int(candidate))
+            top.append(
+                {
+                    "token": text,
+                    "logprob": float(value),
+                    "bytes": list(text.encode("utf-8")),
+                    "token_id": int(candidate),
+                }
+            )
+    mx.eval(sampled)
+    text = _token_text(tokenizer, int(token_id))
+    return {
+        "token": text,
+        "logprob": float(sampled.item()),
+        "bytes": list(text.encode("utf-8")),
+        "token_id": int(token_id),
+        "top_logprobs": top,
+    }
+
+
 @dataclass
 class MLLMSchedulerConfig:
     """Configuration for MLLM scheduler."""
@@ -120,6 +192,10 @@ class MLLMRequest:
     audio: Optional[List[str]] = None
     sampling_params: SamplingParams = field(default_factory=SamplingParams)
     mllm_draft: bool = False
+    # OpenAI-compatible per-token logprobs: report the sampled token's
+    # logprob and its top-N alternatives for every emitted token.
+    logprobs: bool = False
+    top_logprobs: int = 0
     specprefill_config: Optional["SpecPrefillRequestConfig"] = None
     specprefill_outcome: Optional["SpecPrefillOutcome"] = None
     arrival_time: float = field(default_factory=time.time)
@@ -475,6 +551,8 @@ class MLLMScheduler:
             audio=audio,
             sampling_params=sampling_params,
             mllm_draft=bool(kwargs.pop("mllm_draft", False)),
+            logprobs=bool(kwargs.pop("logprobs", False)),
+            top_logprobs=int(kwargs.pop("top_logprobs", 0) or 0),
             specprefill_config=specprefill_config,
         )
 
@@ -722,6 +800,18 @@ class MLLMScheduler:
             if request.first_token_time is None and request.num_output_tokens > 0:
                 request.first_token_time = time.time()
 
+            # Per-token logprobs (request-scoped, off by default). The row is
+            # the one the token was actually sampled from, so in the MTP path
+            # the reported gap belongs to the forward that produced it.
+            logprob_entry = None
+            if request.logprobs and response.finish_reason != "error":
+                logprob_entry = _token_logprob_entry(
+                    response.logprobs,
+                    response.token,
+                    request.top_logprobs,
+                    tokenizer,
+                )
+
             # Decode the new token using streaming detokenizer (UTF-8 safe).
             # Skip stop tokens — they are not content.
             if response.finish_reason == "stop":
@@ -744,6 +834,7 @@ class MLLMScheduler:
                 completion_tokens=request.num_output_tokens,
                 mtp_drafts=request.mtp_drafts,
                 mtp_accepted=request.mtp_accepted,
+                logprobs=[logprob_entry] if logprob_entry else None,
                 specprefill_outcome=request.specprefill_outcome,
             )
 
@@ -1204,10 +1295,16 @@ class MLLMScheduler:
 
         # Collect all outputs
         final_output = None
+        logprob_entries: List[dict] = []
         async for output in self.stream_outputs(request_id):
             final_output = output
+            if output.logprobs:
+                logprob_entries.extend(output.logprobs)
             if output.finished:
                 break
+        if final_output is not None and logprob_entries:
+            # Non-streaming responses carry every token's logprob entry.
+            final_output.logprobs = logprob_entries
 
         if final_output is None:
             # Create empty output on error

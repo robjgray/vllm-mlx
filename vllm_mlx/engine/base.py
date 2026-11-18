@@ -39,6 +39,9 @@ class GenerationOutput:
     # MTP speculative decoding counters. Zero means no MTP attempt occurred.
     mtp_drafts: int = 0
     mtp_accepted: int = 0
+    # OpenAI-compatible per-token logprob entry for the token emitted in this
+    # chunk (None unless the request asked for logprobs).
+    logprobs: dict | None = None
     # Request-level sparse-prefill decision and diagnostics.
     specprefill_outcome: "SpecPrefillOutcome | None" = None
 

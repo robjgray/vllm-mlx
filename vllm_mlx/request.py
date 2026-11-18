@@ -225,6 +225,9 @@ class RequestOutput:
     # MTP speculative decoding counters. Zero means no MTP attempt occurred.
     mtp_drafts: int = 0
     mtp_accepted: int = 0
+    # OpenAI-compatible per-token logprob entries for the tokens emitted in
+    # this step (None unless the request asked for logprobs).
+    logprobs: Optional[List[Dict[str, Any]]] = None
     # Request-level sparse-prefill decision and diagnostics.
     specprefill_outcome: Optional["SpecPrefillOutcome"] = None
 

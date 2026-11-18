@@ -81,6 +81,7 @@ from .api.models import (
     ChatCompletionChunkDelta,  # noqa: F401
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ChoiceLogprobs,
     CompletionChoice,  # noqa: F401
     CompletionRequest,
     CompletionResponse,
@@ -960,6 +961,12 @@ def _prepare_chat_completion_invocation(
     mllm_draft = getattr(request, "mllm_draft", None)
     if mllm_draft is not None:
         chat_kwargs["mllm_draft"] = mllm_draft
+
+    # OpenAI-compatible per-token logprobs: request-scoped and off by default,
+    # so the default path pays nothing for them.
+    if getattr(request, "logprobs", None):
+        chat_kwargs["logprobs"] = True
+        chat_kwargs["top_logprobs"] = int(getattr(request, "top_logprobs", 0) or 0)
 
     if request.tools and request.tool_choice != "none":
         template_tools = convert_tools_for_template(request.tools)
@@ -6313,6 +6320,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                         tool_calls=tool_calls,
                     ),
                     finish_reason=finish_reason,
+                    logprobs=(
+                        ChoiceLogprobs(content=list(output.logprobs))
+                        if getattr(output, "logprobs", None)
+                        else None
+                    ),
                 )
             ],
             usage=Usage(
@@ -7728,6 +7740,11 @@ async def stream_chat_completion(
                                 if (output.finished and tool_calls_detected)
                                 else (output.finish_reason if output.finished else None)
                             ),
+                            logprobs=(
+                                ChoiceLogprobs(content=list(output.logprobs))
+                                if getattr(output, "logprobs", None)
+                                else None
+                            ),
                         )
                     ],
                     usage=(
@@ -7905,6 +7922,11 @@ async def stream_chat_completion(
                                 "tool_calls"
                                 if (output.finished and tool_calls_detected)
                                 else (output.finish_reason if output.finished else None)
+                            ),
+                            logprobs=(
+                                ChoiceLogprobs(content=list(output.logprobs))
+                                if getattr(output, "logprobs", None)
+                                else None
                             ),
                         )
                     ],

@@ -953,6 +953,8 @@ class BatchedEngine(BaseEngine):
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
                 mllm_draft=bool(kwargs.pop("mllm_draft", self._default_mllm_draft)),
+                logprobs=bool(kwargs.pop("logprobs", False)),
+                top_logprobs=int(kwargs.pop("top_logprobs", 0) or 0),
                 specprefill=kwargs.pop("specprefill", None),
                 specprefill_keep_pct=kwargs.pop("specprefill_keep_pct", None),
                 specprefill_backbone_pct=kwargs.pop("specprefill_backbone_pct", None),
@@ -966,6 +968,7 @@ class BatchedEngine(BaseEngine):
                 finish_reason=output.finish_reason,
                 mtp_drafts=output.mtp_drafts,
                 mtp_accepted=output.mtp_accepted,
+                logprobs=getattr(output, "logprobs", None),
                 specprefill_outcome=getattr(output, "specprefill_outcome", None),
             )
 
@@ -1049,6 +1052,8 @@ class BatchedEngine(BaseEngine):
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
                 mllm_draft=bool(kwargs.pop("mllm_draft", self._default_mllm_draft)),
+                logprobs=bool(kwargs.pop("logprobs", False)),
+                top_logprobs=int(kwargs.pop("top_logprobs", 0) or 0),
                 specprefill=kwargs.pop("specprefill", None),
                 specprefill_keep_pct=kwargs.pop("specprefill_keep_pct", None),
                 specprefill_backbone_pct=kwargs.pop("specprefill_backbone_pct", None),
@@ -1064,6 +1069,7 @@ class BatchedEngine(BaseEngine):
                     finish_reason=output.finish_reason,
                     mtp_drafts=output.mtp_drafts,
                     mtp_accepted=output.mtp_accepted,
+                    logprobs=getattr(output, "logprobs", None),
                     specprefill_outcome=getattr(output, "specprefill_outcome", None),
                 )
             return

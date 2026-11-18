@@ -1802,6 +1802,15 @@ class SimpleEngine(BaseEngine):
 
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
         mllm_draft_requested = bool(kwargs.pop("mllm_draft", self._default_mllm_draft))
+        # Per-token logprobs are served by the continuous-batching MLLM path;
+        # this path has no per-token logprob source, so drop the request
+        # instead of forwarding an unknown kwarg to the model.
+        if kwargs.pop("logprobs", False):
+            logger.warning(
+                "logprobs are not supported on the simple engine path; "
+                "use continuous batching to get per-token logprobs"
+            )
+        kwargs.pop("top_logprobs", None)
         has_media = has_media_content(messages)
 
         await self._ensure_text_model_for_request(

@@ -160,6 +160,38 @@ class ResponseFormat(BaseModel):
 
 
 # =============================================================================
+# Logprobs (OpenAI-compatible per-token log probabilities)
+# =============================================================================
+
+
+class TopLogprob(BaseModel):
+    """One alternative token of a ``top_logprobs`` list."""
+
+    token: str
+    logprob: float
+    bytes: list[int] | None = None
+    # Not part of the OpenAI schema, but it makes the entry unambiguous:
+    # two token ids can decode to the same text.
+    token_id: int | None = None
+
+
+class LogprobContent(BaseModel):
+    """Logprob entry of one emitted token."""
+
+    token: str
+    logprob: float
+    bytes: list[int] | None = None
+    token_id: int | None = None
+    top_logprobs: list[TopLogprob] = Field(default_factory=list)
+
+
+class ChoiceLogprobs(BaseModel):
+    """``choices[].logprobs`` payload: one entry per emitted token."""
+
+    content: list[LogprobContent] = Field(default_factory=list)
+
+
+# =============================================================================
 # Chat Completion
 # =============================================================================
 
@@ -200,6 +232,10 @@ class ChatCompletionRequest(BaseModel):
     reasoning_effort: str | None = None
     # Extra kwargs forwarded to tokenizer.apply_chat_template
     chat_template_kwargs: dict[str, Any] | None = None
+    # OpenAI-compatible per-token logprobs. ``logprobs`` turns the payload
+    # on; ``top_logprobs`` asks for that many alternatives per token.
+    logprobs: bool | None = None
+    top_logprobs: int | None = Field(default=None, ge=0, le=20)
     # MLLM-specific parameters
     video_fps: float | None = None
     video_max_frames: int | None = None
@@ -260,6 +296,20 @@ class ChatCompletionChoice(BaseModel):
     index: int = 0
     message: AssistantMessage
     finish_reason: str | None = "stop"
+    # Per-token logprobs. Omitted entirely when the request did not ask for
+    # them, so the default wire format is byte-identical to before.
+    logprobs: ChoiceLogprobs | None = None
+
+    @model_serializer
+    def _serialize(self) -> dict:
+        d: dict = {
+            "index": self.index,
+            "message": self.message.model_dump(),
+            "finish_reason": self.finish_reason,
+        }
+        if self.logprobs is not None:
+            d["logprobs"] = self.logprobs.model_dump()
+        return d
 
 
 class Usage(BaseModel):
@@ -585,6 +635,20 @@ class ChatCompletionChunkChoice(BaseModel):
     index: int = 0
     delta: ChatCompletionChunkDelta
     finish_reason: str | None = None
+    # Per-token logprobs. Omitted entirely when the request did not ask for
+    # them, so the default wire format is byte-identical to before.
+    logprobs: ChoiceLogprobs | None = None
+
+    @model_serializer
+    def _serialize(self) -> dict:
+        d: dict = {
+            "index": self.index,
+            "delta": self.delta.model_dump(),
+            "finish_reason": self.finish_reason,
+        }
+        if self.logprobs is not None:
+            d["logprobs"] = self.logprobs.model_dump()
+        return d
 
 
 class ChatCompletionChunk(BaseModel):

@@ -1702,8 +1702,11 @@ class TestMLLMBatchGeneratorMTPGuards:
             "prefill": 0,
             "no_active_batch": 0,
             "concurrent_batch": 0,
+            "multi_lane": 0,
             "logits_processors": 0,
             "assistant_not_requested": 0,
+            "all_paused_bypass": 0,
+            "cost_gate_bypass": 0,
         }
 
         logits_processor = MagicMock()
@@ -1740,6 +1743,7 @@ class TestMLLMBatchGeneratorMTPGuards:
                 self._step = original_step
                 self._next = MagicMock(return_value=[])
                 self.active_batch = SimpleNamespace(
+                    uids=["uid-1", "uid-2"],
                     requests=[
                         SimpleNamespace(mllm_draft=True),
                         SimpleNamespace(mllm_draft=False),
@@ -1945,6 +1949,311 @@ class TestMLLMBatchGeneratorMTPGuards:
         assert int(mx.argmax(responses[1].logprobs).item()) == 3
         assert draft_model.accept_lens == [0]
         assert generator.get_mtp_stats()["rejected"] == 1
+
+    def test_native_step_publishes_the_accepted_draft_in_the_same_step(
+        self, monkeypatch
+    ):
+        """The native B=1 step publishes what its own forward committed.
+
+        OptiQ's spec loop emits the accepted draft in the step that verified
+        it. The native path does the same: the response carries the step's
+        primary and the accepted draft together, and the next step reuses
+        the verified row as an int - no second forward, no deferred state.
+        """
+        import mlx_vlm.speculative.common as speculative_common
+        import mlx_vlm.speculative.mtp as speculative_mtp
+
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchResponse,
+            install_mtp_mllm,
+        )
+
+        monkeypatch.setenv("VLLM_MLX_MTP_NATIVE_STEP", "1")
+        monkeypatch.setattr(
+            speculative_common, "_batch_cache_left_padding", lambda cache: None
+        )
+        monkeypatch.setattr(
+            speculative_mtp,
+            "_mtp_shared_kv_from_prompt_cache",
+            lambda model, cache: {"shared": object()},
+        )
+        monkeypatch.setattr(
+            speculative_mtp,
+            "_mtp_cache_positions",
+            lambda cache, batch_size: (10, [10] * batch_size),
+        )
+        monkeypatch.setattr(
+            speculative_mtp, "_mtp_draft_position", lambda positions: positions
+        )
+        monkeypatch.setattr(
+            speculative_mtp,
+            "_mtp_draft_block_active",
+            lambda *args, **kwargs: mx.array([[2]], dtype=mx.uint32),
+        )
+
+        request = SimpleNamespace(
+            uid=7,
+            request_id="native-external",
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            mllm_draft=True,
+            output_tokens=[],
+        )
+        active_batch = SimpleNamespace(
+            uids=[7],
+            requests=[request],
+            num_tokens=[0],
+            max_tokens=[8],
+        )
+
+        class Generator:
+            def __init__(self):
+                self.model = object()
+                self.active_batch = active_batch
+                self._step = MagicMock(
+                    side_effect=AssertionError("native MTP must not bypass")
+                )
+                self._next = MagicMock(
+                    return_value=[
+                        MLLMBatchResponse(
+                            uid=7,
+                            request_id=request.request_id,
+                            token=1,
+                            logprobs=mx.zeros(4),
+                        )
+                    ]
+                )
+                self.sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+                self.stop_tokens = set()
+                self._maybe_store_prefix_cache = MagicMock()
+
+        class TrimmableCache:
+            def __init__(self):
+                self.trim_calls = []
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, count):
+                self.trim_calls.append(count)
+
+        class DraftModel:
+            def __init__(self):
+                self.accept_lens = []
+                self.draft_lens = []
+
+            def reset(self, model):
+                self.model = model
+
+            def set_shared_kv(self, *args, **kwargs):
+                return None
+
+        class LanguageModel:
+            def __init__(self):
+                self.inputs = []
+                self.verify_argmax = 2
+
+            def __call__(self, input_tokens, cache=None, return_hidden=False):
+                self.inputs.append(input_tokens.tolist())
+                seq_len = input_tokens.shape[1]
+                logits = mx.full((1, seq_len, 4), -1000.0)
+                if seq_len == 2:
+                    logits[:, 0, self.verify_argmax] = 0.0
+                    logits[:, 1, 3] = 0.0
+                else:
+                    logits[:, -1, 1] = 0.0
+                return logits, mx.zeros((1, seq_len, 2))
+
+        generator = Generator()
+        language_model = LanguageModel()
+        draft_model = DraftModel()
+        cache = TrimmableCache()
+        install_mtp_mllm(generator, language_model, draft_model=draft_model)
+
+        # Step 1: no committed state yet, so the primary comes from a
+        # width-1 forward and the verify commits [primary, draft].
+        generator._step(
+            mx.array([[0]], dtype=mx.uint32),
+            cache=[cache],
+            logits_processors=None,
+            output_tokens=None,
+            samplers=None,
+        )
+        responses = generator._next()
+        assert language_model.inputs == [[[0]], [[1, 2]]]
+        # The base emitted the prefill token; the native step published its
+        # own primary and the accepted draft in the same step.
+        assert [response.token for response in responses] == [1, 1, 2]
+        assert responses[-1].from_draft is True
+        assert draft_model.accept_lens == [1]
+        assert cache.trim_calls == []
+
+        # Step 2: the committed state supplies the primary as an int, so the
+        # step runs no width-1 forward at all.
+        generator._step(
+            mx.array([[1]], dtype=mx.uint32),
+            cache=[cache],
+            logits_processors=None,
+            output_tokens=None,
+            samplers=None,
+        )
+        responses = generator._next()
+        assert language_model.inputs == [[[0]], [[1, 2]], [[3, 2]]]
+        assert [response.token for response in responses] == [3, 2]
+        assert draft_model.accept_lens == [1, 1]
+
+    def test_native_step_trims_and_continues_after_a_rejected_draft(
+        self, monkeypatch
+    ):
+        """A rejected draft is trimmed and the lane keeps drafting.
+
+        The shipped path parks a rejected lane for a step (or rolls the
+        cache back and re-runs the prefix). The native path trims the cache
+        to the committed length and continues in the same step, with the
+        correction token as the next primary.
+        """
+        import mlx_vlm.speculative.common as speculative_common
+        import mlx_vlm.speculative.mtp as speculative_mtp
+
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchResponse,
+            install_mtp_mllm,
+        )
+
+        monkeypatch.setenv("VLLM_MLX_MTP_NATIVE_STEP", "1")
+        monkeypatch.setattr(
+            speculative_common, "_batch_cache_left_padding", lambda cache: None
+        )
+        monkeypatch.setattr(
+            speculative_mtp,
+            "_mtp_shared_kv_from_prompt_cache",
+            lambda model, cache: {"shared": object()},
+        )
+        monkeypatch.setattr(
+            speculative_mtp,
+            "_mtp_cache_positions",
+            lambda cache, batch_size: (10, [10] * batch_size),
+        )
+        monkeypatch.setattr(
+            speculative_mtp, "_mtp_draft_position", lambda positions: positions
+        )
+        monkeypatch.setattr(
+            speculative_mtp,
+            "_mtp_draft_block_active",
+            lambda *args, **kwargs: mx.array([[2]], dtype=mx.uint32),
+        )
+
+        request = SimpleNamespace(
+            uid=7,
+            request_id="native-reject",
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            mllm_draft=True,
+            output_tokens=[],
+        )
+        active_batch = SimpleNamespace(
+            uids=[7],
+            requests=[request],
+            num_tokens=[0],
+            max_tokens=[8],
+        )
+
+        class Generator:
+            def __init__(self):
+                self.model = object()
+                self.active_batch = active_batch
+                self._step = MagicMock(
+                    side_effect=AssertionError("native MTP must not bypass")
+                )
+                self._next = MagicMock(
+                    return_value=[
+                        MLLMBatchResponse(
+                            uid=7,
+                            request_id=request.request_id,
+                            token=1,
+                            logprobs=mx.zeros(4),
+                        )
+                    ]
+                )
+                self.sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+                self.stop_tokens = set()
+                self._maybe_store_prefix_cache = MagicMock()
+
+        class TrimmableCache:
+            def __init__(self):
+                self.trim_calls = []
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, count):
+                self.trim_calls.append(count)
+
+        class DraftModel:
+            def __init__(self):
+                self.accept_lens = []
+                self.draft_lens = []
+
+            def reset(self, model):
+                self.model = model
+
+            def set_shared_kv(self, *args, **kwargs):
+                return None
+
+        class LanguageModel:
+            def __init__(self):
+                self.inputs = []
+                self.verify_argmax = 1
+
+            def __call__(self, input_tokens, cache=None, return_hidden=False):
+                self.inputs.append(input_tokens.tolist())
+                seq_len = input_tokens.shape[1]
+                logits = mx.full((1, seq_len, 4), -1000.0)
+                if seq_len == 2:
+                    logits[:, 0, self.verify_argmax] = 0.0
+                    logits[:, 1, 3] = 0.0
+                else:
+                    logits[:, -1, 1] = 0.0
+                return logits, mx.zeros((1, seq_len, 2))
+
+        generator = Generator()
+        language_model = LanguageModel()
+        draft_model = DraftModel()
+        cache = TrimmableCache()
+        install_mtp_mllm(generator, language_model, draft_model=draft_model)
+
+        generator._step(
+            mx.array([[0]], dtype=mx.uint32),
+            cache=[cache],
+            logits_processors=None,
+            output_tokens=None,
+            samplers=None,
+        )
+        responses = generator._next()
+        # The draft (2) was rejected: the verify preferred token 1. The
+        # rejected position is trimmed and nothing is published for it.
+        assert cache.trim_calls == [1]
+        assert [response.token for response in responses] == [1, 1]
+        assert draft_model.accept_lens == [0]
+
+        # The lane keeps drafting: the next step runs the verify with the
+        # correction token as its primary, with no extra width-1 forward.
+        generator._step(
+            mx.array([[1]], dtype=mx.uint32),
+            cache=[cache],
+            logits_processors=None,
+            output_tokens=None,
+            samplers=None,
+        )
+        responses = generator._next()
+        assert language_model.inputs == [[[0]], [[1, 2]], [[1, 2]]]
+        assert draft_model.accept_lens == [0, 0]
+        assert generator.get_mtp_stats()["rejected"] == 2
+        assert generator.get_mtp_stats()["bypass_counts"].get("prefill", 0) == 0
 
     def test_pure_attention_rejection_skips_the_replay_forward(self, monkeypatch):
         """A rejected draft on a KV-only stack must not re-forward the prefix.
@@ -2155,6 +2464,231 @@ class TestMLLMBatchGeneratorMTPGuards:
         assert position == prefix + sum(1 for a in accept if a) * 2 + sum(
             1 for a in accept if not a
         )
+
+    def test_pause_branch_rewinds_the_primary_before_its_next_forward(
+        self, monkeypatch
+    ):
+        """A rejected draft must leave the pause branch's cache at the primary.
+
+        The pause branch discards the reject step's skip state and runs a FULL
+        forward on the next step, and the base generator feeds that forward the
+        token the previous step emitted -- which the verify forward has already
+        appended. Rolling back only the draft therefore leaves the cache one
+        token ahead of the committed stream, and the next forward appends the
+        primary a SECOND time: the context carries a duplicate token and every
+        later rotary position is shifted by one, which flips the target's own
+        greedy choice. The paused lane re-feeds the primary, so the draft AND
+        the primary have to be dropped at the reject.
+        """
+        import mlx_vlm.speculative.common as speculative_common
+        import mlx_vlm.speculative.mtp as speculative_mtp
+        from mlx_vlm.models.cache import BatchKVCache
+
+        from vllm_mlx.mllm_batch_generator import install_mtp_mllm
+
+        monkeypatch.setenv("VLLM_MLX_MTP_REJECT_DEFER", "1")
+        monkeypatch.setenv("VLLM_MLX_MTP_B1_BYPASS", "0")
+        monkeypatch.delenv("VLLM_MLX_MTP_RESUME_REJECT", raising=False)
+
+        monkeypatch.setattr(
+            speculative_common, "_batch_cache_left_padding", lambda cache: None
+        )
+        monkeypatch.setattr(
+            speculative_mtp,
+            "_mtp_shared_kv_from_prompt_cache",
+            lambda model, cache: {"shared": object()},
+        )
+        monkeypatch.setattr(
+            speculative_mtp,
+            "_mtp_cache_positions",
+            lambda cache, batch_size: (1, [1] * batch_size),
+        )
+        monkeypatch.setattr(
+            speculative_mtp, "_mtp_draft_position", lambda positions: positions
+        )
+        # The stub drafter always proposes token 2; the target's own choice
+        # for the drafted position is 7, so every draft is rejected.
+        monkeypatch.setattr(
+            speculative_mtp,
+            "_mtp_draft_block_active",
+            lambda *args, **kwargs: mx.array([[2]], dtype=mx.uint32),
+        )
+
+        request = SimpleNamespace(
+            uid=3,
+            request_id="pause-reject",
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            mllm_draft=True,
+            output_tokens=[],
+        )
+        active_batch = SimpleNamespace(
+            uids=[3], requests=[request], num_tokens=[0], max_tokens=[8]
+        )
+
+        class LanguageModel:
+            """Target whose own choice depends on the context length.
+
+            The preferred token at a position is a function of how many tokens
+            the cache already holds, so a cache that carries a duplicate
+            primary reads a different row than the plain path does.
+            """
+
+            CHOICE = {0: 1, 1: 5, 2: 7, 3: 3}
+
+            def __init__(self):
+                self.rows = []
+
+            def __call__(self, input_tokens, cache=None, return_hidden=False):
+                seq_len = input_tokens.shape[1]
+                base = int(cache[0].offset[0].item())
+                for entry in cache or []:
+                    embeds = mx.zeros((1, 1, seq_len, 4))
+                    entry.update_and_fetch(embeds, embeds)
+                logits = mx.full((1, seq_len, 8), -1000.0)
+                for row in range(seq_len):
+                    logits[:, row, self.CHOICE[base + row + 1]] = 0.0
+                self.rows.append(logits)
+                return logits, mx.zeros((1, seq_len, 2))
+
+        language_model = LanguageModel()
+
+        class Generator:
+            def __init__(self):
+                self.model = object()
+                self.active_batch = active_batch
+                self.sampler = MagicMock()
+                self.stop_tokens = set()
+                self._maybe_store_prefix_cache = MagicMock()
+                self._next = MagicMock(return_value=[])
+
+            def _step(
+                self,
+                input_tokens,
+                cache,
+                logits_processors,
+                output_tokens,
+                samplers,
+                **kwargs,
+            ):
+                logits, _hidden = language_model(
+                    input_tokens, cache=cache, return_hidden=True
+                )
+                row = logits[:, -1, :]
+                logprobs = row - mx.logsumexp(row, axis=-1, keepdims=True)
+                return samplers[0](logprobs), [logprobs]
+
+        class DraftModel:
+            def __init__(self):
+                self.accept_lens = []
+                self.draft_lens = []
+
+            def reset(self, model):
+                self.model = model
+
+            def set_shared_kv(self, *args, **kwargs):
+                return None
+
+        generator = Generator()
+        draft_model = DraftModel()
+        cache = [BatchKVCache([0])]
+        install_mtp_mllm(generator, language_model, draft_model=draft_model)
+
+        def step(tokens):
+            return generator._step(
+                mx.array([[tokens]], dtype=mx.uint32),
+                cache=cache,
+                logits_processors=None,
+                output_tokens=None,
+                samplers=[
+                    lambda logprobs: mx.argmax(logprobs, axis=-1).astype(mx.uint32)
+                ],
+            )
+
+        primary, _ = step(0)
+        assert int(primary[0].item()) == 5
+        # the stub draft was rejected and the lane is paused for one step
+        assert draft_model.accept_lens == [0]
+        assert generator._reject_paused_uids == {3}
+
+        # (i) the cache holds exactly the tokens the model has committed to
+        # its context -- the prompt token. The primary was emitted, but the
+        # base generator feeds it on the NEXT step, so a cache that already
+        # holds it duplicates it.
+        assert int(cache[0].offset[0].item()) == 1
+
+        # The paused lane runs a full forward and re-feeds the primary.
+        emitted, _ = step(int(primary[0].item()))
+        # (ii) the token emitted after the reject is the target's own choice
+        # for that position (7), not the row a duplicated context would read.
+        assert int(emitted[0].item()) == 7
+        assert int(cache[0].offset[0].item()) == 2
+
+        # (iii) the live cache's next-token row equals the plain path's row
+        # over the same committed ids.
+        plain_cache = [BatchKVCache([0])]
+        plain_rows = []
+        for token in (0, int(primary[0].item())):
+            logits, _hidden = language_model(
+                mx.array([[token]], dtype=mx.uint32),
+                cache=plain_cache,
+                return_hidden=True,
+            )
+            plain_rows.append(logits)
+        live_row = language_model.rows[-1][:, -1, :]
+        plain_row = plain_rows[-1][:, -1, :]
+        assert mx.allclose(live_row, plain_row).item()
+        assert int(mx.argmax(live_row, axis=-1).item()) == 7
+
+    @pytest.mark.parametrize("window", [8, 16])
+    def test_reject_rollback_of_two_keeps_a_wrapped_ring_cache_exact(self, window):
+        """A two-token rewind must equal never appending the verified pair.
+
+        The pause branch re-feeds the primary on its next forward, so the
+        reject path drops the draft AND the primary. On a sliding-window ring
+        that rewind splices two columns out of the physical buffer, and the
+        ring's write cursor then has to be the buffer's own length: sizing
+        the next buffer growth from a running total that is already past the
+        window yields a negative dimension ("Negative dimensions not
+        allowed") and kills the request.
+        """
+        from mlx_vlm.models.cache import BatchRotatingKVCache
+
+        from vllm_mlx.mllm_batch_generator import _rollback_appended_tokens
+
+        batch, heads, dim = 1, 2, 4
+
+        def attend(cache, keys, values, query):
+            width = keys.shape[2]
+            mask = cache.make_mask(width)
+            key_cache, value_cache = cache.update_and_fetch(keys, values)
+            return mx.fast.scaled_dot_product_attention(
+                query, key_cache, value_cache, scale=0.5, mask=mask
+            )
+
+        mx.random.seed(11)
+        tokens = [mx.random.normal((batch, heads, 1, dim)) for _ in range(4 * window)]
+        query = mx.random.normal((batch, heads, 1, dim))
+        verify_query = mx.concatenate([query, query], axis=2)
+        feed = mx.random.normal((batch, heads, 1, dim))
+
+        cache = BatchRotatingKVCache(window, [0])
+        for index in range(3 * window):
+            attend(cache, tokens[index], tokens[index], query)
+        pair = mx.concatenate([tokens[0], tokens[1]], axis=2)
+        attend(cache, pair, pair, verify_query)
+        assert _rollback_appended_tokens([cache], 2)
+
+        # The rewind must leave the cache attending exactly like one that
+        # never saw the verified pair, once the primary is fed back.
+        reference = BatchRotatingKVCache(window, [0])
+        for index in range(3 * window):
+            attend(reference, tokens[index], tokens[index], query)
+        expected = attend(reference, feed, feed, query)
+        actual = attend(cache, feed, feed, query)
+        assert mx.allclose(expected, actual, atol=1e-4).item()
 
     def test_uniform_draft_batches_remove_only_selected_requests(self):
         from vllm_mlx.mllm_batch_generator import (
@@ -4118,3 +4652,1035 @@ def test_scheduler_step_error_fails_every_request_once():
     assert "_fail_requests_after_step_error(e)" in inspect.getsource(
         MLLMScheduler._process_loop
     )
+
+
+class TestIncrementalSharedKVPublisher:
+    """The incremental publication must equal the device-side publication.
+
+    The drafter is handed the target's K/V for the committed prefix. The
+    incremental publisher reads the two layers the drafter actually shares
+    and tracks the batch's positions on the host; the device-side
+    publication rebuilds the view from every layer and reads the offsets
+    back from the device. Both must publish the same tensors and the same
+    positions, on every step of a request: after a rejected draft's
+    rollback, after a prefill boundary and across the rotating cache's
+    wrap.
+    """
+
+    LAYER_TYPES = [
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention",
+    ]
+    HEADS = 2
+    HEAD_DIM = 4
+    WINDOW = 8
+
+    @classmethod
+    def _model(cls):
+        from vllm_mlx.mllm_batch_generator import _SharedKVPublisher
+
+        class _Layer:
+            def __init__(self, layer_type):
+                self.layer_type = layer_type
+
+        class _Inner:
+            def __init__(self, layers):
+                self.layers = layers
+
+        class _LM:
+            def __init__(self, layers):
+                self.model = _Inner(layers)
+
+        language_model = _LM([_Layer(t) for t in cls.LAYER_TYPES])
+        return language_model, _SharedKVPublisher(language_model)
+
+    @classmethod
+    def _cache(cls, ctx=0, window=None, batch=1, padding=None):
+        from mlx_vlm.models.cache import BatchKVCache, BatchRotatingKVCache
+
+        window = window or cls.WINDOW
+        pads = list(padding) if padding is not None else [0] * batch
+        leaves = []
+        for layer_type in cls.LAYER_TYPES:
+            if layer_type == "full_attention":
+                leaf = BatchKVCache(pads)
+            else:
+                leaf = BatchRotatingKVCache(window, pads)
+            leaves.append(leaf)
+        if ctx:
+            cls._append(leaves, ctx, batch)
+        return leaves
+
+    @classmethod
+    def _append(cls, leaves, count, batch=1):
+        """Append ``count`` tokens to every leaf, like a forward would."""
+        keys = mx.arange(
+            batch * cls.HEADS * count * cls.HEAD_DIM, dtype=mx.float32
+        ).reshape(batch, cls.HEADS, count, cls.HEAD_DIM)
+        for leaf in leaves:
+            leaf.update_and_fetch(keys, keys + 1000.0)
+
+    @classmethod
+    def _assert_same_as_device_side(cls, publisher, leaves, batch=1):
+        from mlx_vlm.speculative.mtp import _mtp_cache_positions
+
+        from vllm_mlx.mllm_batch_generator import _shared_kv_states
+
+        language_model = publisher._language_model
+        expected = _shared_kv_states(language_model, leaves)
+        published = publisher.publish(leaves, batch, ("uid-1",))
+        assert published is not None
+        shared_kv, kv_offset, positions = published
+        assert set(shared_kv) == set(expected)
+        for layer_type, (keys, values) in expected.items():
+            got_keys, got_values = shared_kv[layer_type]
+            assert got_keys.shape == keys.shape, layer_type
+            assert bool(mx.array_equal(got_keys, keys)), layer_type
+            assert bool(mx.array_equal(got_values, values)), layer_type
+        _, device_positions = _mtp_cache_positions(leaves, batch)
+        assert positions == device_positions
+        assert kv_offset == max(device_positions)
+        return shared_kv
+
+    def test_matches_device_side_publication(self):
+        language_model, publisher = self._model()
+        leaves = self._cache(ctx=10)
+        self._assert_same_as_device_side(publisher, leaves)
+
+    def test_matches_device_side_publication_after_rollback(self):
+        """A rejected draft rolls the cache back; the next publication must
+        see the rolled-back state and the rolled-back position."""
+        language_model, publisher = self._model()
+        leaves = self._cache(ctx=10)
+        publisher.publish(leaves, 1, ("uid-1",))
+        # The reject path trims the appended tokens back off the cache.
+        for leaf in leaves:
+            leaf.trim(2)
+        self._assert_same_as_device_side(publisher, leaves)
+
+    def test_matches_device_side_publication_after_prefill_boundary(self):
+        """A prefill appends the whole prompt at once; the publication must
+        pick the jump up instead of assuming one token per step."""
+        language_model, publisher = self._model()
+        leaves = self._cache(ctx=4)
+        publisher.publish(leaves, 1, ("uid-1",))
+        self._append(leaves, 30)
+        self._assert_same_as_device_side(publisher, leaves)
+
+    def test_matches_device_side_publication_across_rotating_boundary(self):
+        """The rotating ring wraps; the published K/V must stay in temporal
+        order and must not carry the evicted keys."""
+        language_model, publisher = self._model()
+        leaves = self._cache(ctx=2, window=self.WINDOW)
+        for _ in range(6):
+            self._append(leaves, 2)
+            self._assert_same_as_device_side(publisher, leaves)
+
+    def test_falls_back_for_a_multi_lane_batch(self):
+        language_model, publisher = self._model()
+        leaves = self._cache(ctx=6, batch=2)
+        assert publisher.publish(leaves, 2, ("uid-1", "uid-2")) is None
+
+    def test_falls_back_for_a_left_padded_lane(self):
+        """A left-padded lane makes the drafter's normalisation roll the
+        published K/V, so the fast path must not be taken."""
+        language_model, publisher = self._model()
+        leaves = self._cache(ctx=6, batch=1, padding=[2])
+        assert publisher.publish(leaves, 1, ("uid-1",)) is None
+
+    def test_batch_membership_change_rebases_the_publisher(self):
+        """A new batch re-reads the batch's offsets; the positions must
+        follow the new batch, not the old one."""
+        language_model, publisher = self._model()
+        leaves = self._cache(ctx=6)
+        publisher.publish(leaves, 1, ("uid-1",))
+        leaves = self._cache(ctx=12)
+        published = publisher.publish(leaves, 1, ("uid-2",))
+        assert published is not None
+        assert published[2] == [12]
+
+
+class TestDeepDraftChain:
+    """The deep draft path: K drafts per round, one fused width-(K+1) forward.
+
+    The round is the prior art's shape (Ollama's speculate.go): the drafter
+    proposes K tokens, the target verifies the primary position AND the whole
+    chain in ONE forward, and the accepted prefix is committed.
+    """
+
+    # The fake target's own greedy choice per absolute position.
+    CHOICE = {1: 4, 2: 7, 3: 3, 4: 5, 5: 6, 6: 2, 7: 3, 8: 5}
+
+    def _install(self, monkeypatch, depth, chain, native=False):
+        import mlx_vlm.speculative.common as speculative_common
+        import mlx_vlm.speculative.mtp as speculative_mtp
+        from mlx_vlm.models.cache import BatchKVCache
+
+        from vllm_mlx.mllm_batch_generator import install_mtp_mllm
+
+        monkeypatch.setenv("VLLM_MLX_MTP_REJECT_DEFER", "1")
+        monkeypatch.setenv("VLLM_MLX_MTP_RESUME_REJECT", "1")
+        monkeypatch.setenv("VLLM_MLX_MTP_B1_BYPASS", "0")
+        monkeypatch.setenv("VLLM_MLX_MTP_DRAFT_DEPTH", str(depth))
+        if native:
+            monkeypatch.setenv("VLLM_MLX_MTP_NATIVE_STEP", "1")
+        else:
+            monkeypatch.delenv("VLLM_MLX_MTP_NATIVE_STEP", raising=False)
+
+        monkeypatch.setattr(
+            speculative_common, "_batch_cache_left_padding", lambda cache: None
+        )
+        monkeypatch.setattr(
+            speculative_mtp,
+            "_mtp_shared_kv_from_prompt_cache",
+            lambda model, cache: {"shared": object()},
+        )
+        monkeypatch.setattr(
+            speculative_mtp,
+            "_mtp_cache_positions",
+            lambda cache, batch_size: (1, [1] * batch_size),
+        )
+        monkeypatch.setattr(
+            speculative_mtp, "_mtp_draft_position", lambda positions: positions
+        )
+
+        def _fake_draft_block_active(*args, **kwargs):
+            block_size = args[3]
+            drafted = chain[: max(block_size - 1, 1)]
+            return mx.array([drafted], dtype=mx.uint32)
+
+        monkeypatch.setattr(
+            speculative_mtp, "_mtp_draft_block_active", _fake_draft_block_active
+        )
+
+        request = SimpleNamespace(
+            uid=3,
+            request_id="deep",
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            mllm_draft=True,
+            output_tokens=[],
+        )
+        active_batch = SimpleNamespace(
+            uids=[3], requests=[request], num_tokens=[0], max_tokens=[8]
+        )
+
+        choice_map = self.CHOICE
+
+        def choice(pos):
+            return choice_map.get(pos, 6)
+
+        class LanguageModel:
+            """Target whose own choice depends on the absolute position."""
+
+            def __init__(self):
+                self.widths = []
+
+            def __call__(self, input_tokens, cache=None, return_hidden=False):
+                seq_len = input_tokens.shape[1]
+                base = int(cache[0].offset[0].item())
+                for entry in cache or []:
+                    embeds = mx.zeros((1, 1, seq_len, 4))
+                    entry.update_and_fetch(embeds, embeds)
+                logits = mx.full((1, seq_len, 8), -1000.0)
+                for row in range(seq_len):
+                    logits[:, row, choice(base + row + 1)] = 0.0
+                self.widths.append(seq_len)
+                return logits, mx.zeros((1, seq_len, 2))
+
+        language_model = LanguageModel()
+
+        class Generator:
+            def __init__(self):
+                self.model = object()
+                self.active_batch = active_batch
+                self.sampler = MagicMock()
+                self.stop_tokens = set()
+                self._maybe_store_prefix_cache = MagicMock()
+                self.pending = 0
+                self._next = self._fake_next
+
+            def _fake_next(self):
+                """Emulate the base generator: run the step, then emit the
+                token that was fed to it (the base yields what it fed)."""
+                from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
+
+                fed = self.pending
+                primary, _logprobs = self._step(
+                    mx.array([[fed]], dtype=mx.uint32),
+                    cache=self.cache,
+                    logits_processors=None,
+                    output_tokens=None,
+                    samplers=[
+                        lambda logprobs: mx.argmax(logprobs, axis=-1).astype(mx.uint32)
+                    ],
+                )
+                self.pending = int(primary[0].item())
+                return [
+                    MLLMBatchResponse(
+                        uid=3,
+                        request_id="deep",
+                        token=fed,
+                        logprobs=mx.zeros((8,)),
+                        finish_reason=None,
+                        prompt_tokens=1,
+                        specprefill_outcome=None,
+                    )
+                ]
+
+            def _step(
+                self,
+                input_tokens,
+                cache,
+                logits_processors,
+                output_tokens,
+                samplers,
+                **kwargs,
+            ):
+                logits, _hidden = language_model(
+                    input_tokens, cache=cache, return_hidden=True
+                )
+                row = logits[:, -1, :]
+                logprobs = row - mx.logsumexp(row, axis=-1, keepdims=True)
+                return samplers[0](logprobs), [logprobs]
+
+        class DraftModel:
+            def __init__(self):
+                self.accept_lens = []
+                self.draft_lens = []
+
+            def reset(self, model):
+                self.model = model
+
+            def set_shared_kv(self, *args, **kwargs):
+                return None
+
+        generator = Generator()
+        draft_model = DraftModel()
+        cache = [BatchKVCache([0])]
+        generator.cache = cache
+        install_mtp_mllm(generator, language_model, draft_model=draft_model)
+        return generator, draft_model, language_model, cache
+
+    def _step(self, generator, cache, token):
+        generator.pending = token
+        return generator._step(
+            mx.array([[token]], dtype=mx.uint32),
+            cache=cache,
+            logits_processors=None,
+            output_tokens=None,
+            samplers=[
+                lambda logprobs: mx.argmax(logprobs, axis=-1).astype(mx.uint32)
+            ],
+        )
+
+    def test_deep_draft_verifies_the_chain_in_one_fused_forward(self, monkeypatch):
+        """K drafts, ONE width-(K+1) forward, and the cache left at the
+        committed token count (the rejected tail rolled back)."""
+        generator, draft_model, language_model, cache = self._install(
+            monkeypatch, 3, [7, 3, 9]
+        )
+        generator.pending = 0
+        generator._next()
+
+        # One width-1 forward for the primary, then ONE fused width-4 forward
+        # for the primary position plus the three drafted positions.
+        assert language_model.widths == [1, 4]
+
+        # The chain [7, 3, 9] is accepted up to the third draft: the target's
+        # own choices at positions 2 and 3 are 7 and 3, at position 4 it is 5.
+        assert draft_model.draft_lens == [3]
+        assert draft_model.accept_lens == [2]
+
+        stats = generator.get_mtp_stats()
+        assert stats["attempted"] == 1
+        assert stats["accepted"] == 2
+        assert stats["rejected"] == 1
+        assert stats["acceptance_rate"] == 2 / 3
+
+        # The cache holds exactly the committed tokens: the prompt token, the
+        # primary and the two accepted drafts. The rejected draft (9) is out.
+        assert int(cache[0].offset[0].item()) == 4
+
+    def test_deep_draft_publishes_the_accepted_chain_in_order(self, monkeypatch):
+        """The accepted chain is published after the primary, in order."""
+        generator, _draft_model, _language_model, cache = self._install(
+            monkeypatch, 3, [7, 3, 9]
+        )
+        generator.pending = 0
+
+        # The first turn emits the token the base generator fed; the accepted
+        # chain follows the primary on the next turn.
+        first = generator._next()
+        assert [r.token for r in first] == [0]
+
+        second = generator._next()
+        assert [r.token for r in second] == [4, 7, 3]
+        assert [r.from_draft for r in second] == [False, True, True]
+
+        # The next round's primary is the target's own choice at the first
+        # rejected position (5), not a re-draft.
+        assert generator.pending == 5
+        # The cache is at the committed token count: the prompt token, round
+        # one's primary and its two accepted drafts, and round two's primary.
+        # Round two's chain was rejected as a whole, so nothing of it stays.
+        assert int(cache[0].offset[0].item()) == 5
+
+    def test_native_step_carries_the_committed_token_at_depth(self, monkeypatch):
+        """Composed path: the deep chain AND the native step.
+
+        The native step carries the committed token as an int, so the second
+        round needs no width-1 forward at all (the primary comes from the
+        slot, not from re-deriving the stored [1, V] logits row), and the
+        accepted chain is still published as the deferred suffix, in order,
+        exactly as the deep path publishes it.
+
+        The slot's hidden must keep the TARGET's rank ([batch, seq, dim]):
+        the native step's own slot carries a single row ([1, dim]) and the
+        step re-adds the batch axis, so a slot that already carries the batch
+        axis hands the drafter a fourth dimension and every step fails.
+        """
+        import mlx_vlm.speculative.mtp as speculative_mtp
+
+        seen = []
+
+        def _record(model, hidden):
+            seen.append(tuple(hidden.shape))
+            return hidden
+
+        monkeypatch.setattr(speculative_mtp, "_mtp_draft_hidden", _record)
+        generator, draft_model, language_model, cache = self._install(
+            monkeypatch, 3, [7, 3, 9], native=True
+        )
+        generator.pending = 0
+
+        first = generator._next()
+        assert [r.token for r in first] == [0]
+        # Round one: the width-1 forward (no committed state yet) and the one
+        # fused width-4 verify.
+        assert language_model.widths == [1, 4]
+
+        second = generator._next()
+        # The chain is still the deferred suffix, in order, after the primary.
+        assert [r.token for r in second] == [4, 7, 3]
+        assert [r.from_draft for r in second] == [False, True, True]
+        # Round two ran NO width-1 forward: the committed token came from the
+        # native slot as an int.
+        assert language_model.widths == [1, 4, 4]
+        # The counters, per DRAFT: round one accepted two of its three
+        # drafts, round two rejected all three.
+        stats = generator.get_mtp_stats()
+        assert stats["attempted"] == 2
+        assert stats["accepted"] == 2
+        assert stats["rejected"] == 4
+        assert draft_model.draft_lens == [3, 3]
+        assert draft_model.accept_lens == [2, 0]
+        # The cache is at exactly the committed token count: the prompt
+        # token, round one's primary and its two accepted drafts, and round
+        # two's primary. Round two's chain was rejected as a whole.
+        assert int(cache[0].offset[0].item()) == 5
+        # Every drafter call saw a three-dimensional hidden.
+        assert seen, "the drafter was never called"
+        assert all(len(shape) == 3 for shape in seen), seen
+
+    def test_draft_depth_one_is_the_shipped_single_draft(self, monkeypatch):
+        """Depth 1 (the default) keeps the shipped width-2 verify."""
+        generator, draft_model, language_model, cache = self._install(
+            monkeypatch, 1, [7]
+        )
+        generator.pending = 0
+        generator._next()
+
+        assert language_model.widths == [1, 2]
+        assert draft_model.draft_lens == [1]
+        assert draft_model.accept_lens == [1]
+        stats = generator.get_mtp_stats()
+        assert stats["accepted"] == 1
+        assert stats["rejected"] == 0
+        assert int(cache[0].offset[0].item()) == 3
+
+
+class TestDeepDraftRingRollback:
+    """The deep path rolls back on EVERY reject: the ring's logical position
+    and its physical buffer must stay consistent across many rejects.
+
+    The fork's splice rollback shrinks the ring's physical buffer while the
+    logical position moves back by the same amount. That is only exact if
+    the two stay in step: the campaign's width-slope probe found the
+    bookkeeping drifting once per call, and the deep path calls it on every
+    reject (not once per request), so the drift accumulates much faster here
+    than on the shipped path.
+
+    The invariants checked after every round:
+      * the cache's logical offset is exactly the committed token count,
+      * the physical buffer stays inside the ring's own design bound
+        (max_size + width - 1), i.e. it does not grow past the window,
+      * the host-side running total (_offset, the counter the incremental
+        publisher reads) stays equal to the logical offset.
+    """
+
+    def _install(self, monkeypatch, depth=2, max_size=16):
+        import mlx_vlm.speculative.common as speculative_common
+        import mlx_vlm.speculative.mtp as speculative_mtp
+        from mlx_vlm.models.cache import BatchRotatingKVCache
+
+        from vllm_mlx.mllm_batch_generator import install_mtp_mllm
+
+        monkeypatch.setenv("VLLM_MLX_MTP_REJECT_DEFER", "1")
+        monkeypatch.setenv("VLLM_MLX_MTP_RESUME_REJECT", "1")
+        monkeypatch.setenv("VLLM_MLX_MTP_B1_BYPASS", "0")
+        monkeypatch.setenv("VLLM_MLX_MTP_DRAFT_DEPTH", str(depth))
+
+        monkeypatch.setattr(
+            speculative_common, "_batch_cache_left_padding", lambda cache: None
+        )
+        monkeypatch.setattr(
+            speculative_mtp,
+            "_mtp_shared_kv_from_prompt_cache",
+            lambda model, cache: {"shared": object()},
+        )
+        monkeypatch.setattr(
+            speculative_mtp,
+            "_mtp_cache_positions",
+            lambda cache, batch_size: (1, [1] * batch_size),
+        )
+        monkeypatch.setattr(
+            speculative_mtp, "_mtp_draft_position", lambda positions: positions
+        )
+
+        # The drafter always proposes a token the target rejects, so every
+        # round rolls the whole chain back.
+        monkeypatch.setattr(
+            speculative_mtp,
+            "_mtp_draft_block_active",
+            lambda *args, **kwargs: mx.array([[9, 9]], dtype=mx.uint32),
+        )
+
+        request = SimpleNamespace(
+            uid=5,
+            request_id="ring",
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            mllm_draft=True,
+            output_tokens=[],
+        )
+        active_batch = SimpleNamespace(
+            uids=[5], requests=[request], num_tokens=[0], max_tokens=[64]
+        )
+
+        class LanguageModel:
+            def __init__(self):
+                self.widths = []
+
+            def __call__(self, input_tokens, cache=None, return_hidden=False):
+                seq_len = input_tokens.shape[1]
+                for entry in cache or []:
+                    embeds = mx.zeros((1, 1, seq_len, 4))
+                    entry.update_and_fetch(embeds, embeds)
+                logits = mx.full((1, seq_len, 8), -1000.0)
+                logits[:, :, 3] = 0.0
+                self.widths.append(seq_len)
+                return logits, mx.zeros((1, seq_len, 2))
+
+        language_model = LanguageModel()
+
+        class Generator:
+            def __init__(self):
+                self.model = object()
+                self.active_batch = active_batch
+                self.sampler = MagicMock()
+                self.stop_tokens = set()
+                self._maybe_store_prefix_cache = MagicMock()
+                self.pending = 0
+                self._next = self._fake_next
+
+            def _fake_next(self):
+                from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
+
+                fed = self.pending
+                primary, _logprobs = self._step(
+                    mx.array([[fed]], dtype=mx.uint32),
+                    cache=self.cache,
+                    logits_processors=None,
+                    output_tokens=None,
+                    samplers=[
+                        lambda logprobs: mx.argmax(logprobs, axis=-1).astype(mx.uint32)
+                    ],
+                )
+                self.pending = int(primary[0].item())
+                return [
+                    MLLMBatchResponse(
+                        uid=5,
+                        request_id="ring",
+                        token=fed,
+                        logprobs=mx.zeros((8,)),
+                        finish_reason=None,
+                        prompt_tokens=1,
+                        specprefill_outcome=None,
+                    )
+                ]
+
+            def _step(
+                self,
+                input_tokens,
+                cache,
+                logits_processors,
+                output_tokens,
+                samplers,
+                **kwargs,
+            ):
+                logits, _hidden = language_model(
+                    input_tokens, cache=cache, return_hidden=True
+                )
+                row = logits[:, -1, :]
+                logprobs = row - mx.logsumexp(row, axis=-1, keepdims=True)
+                return samplers[0](logprobs), [logprobs]
+
+        class DraftModel:
+            def __init__(self):
+                self.accept_lens = []
+                self.draft_lens = []
+
+            def reset(self, model):
+                self.model = model
+
+            def set_shared_kv(self, *args, **kwargs):
+                return None
+
+        generator = Generator()
+        draft_model = DraftModel()
+        cache = [BatchRotatingKVCache(max_size, [0])]
+        generator.cache = cache
+        install_mtp_mllm(generator, language_model, draft_model=draft_model)
+        return generator, draft_model, language_model, cache, max_size
+
+    def test_rejects_leave_the_ring_consistent_across_many_rounds(self, monkeypatch):
+        generator, draft_model, _language_model, cache, max_size = self._install(
+            monkeypatch
+        )
+        width = 3  # depth 2 -> a width-3 fused verify
+        committed = 1  # the prompt token
+        for _round in range(40):
+            generator.pending = committed - 1
+            generator._next()
+            committed += 1  # every round commits its primary, nothing else
+            offset = int(cache[0].offset[0].item())
+            assert offset == committed, (
+                f"logical offset {offset} != committed {committed}"
+            )
+            assert cache[0]._offset == committed, (
+                f"host running total {cache[0]._offset} != committed {committed}"
+            )
+            physical = cache[0].keys.shape[2]
+            assert physical <= max_size + width - 1, (
+                f"physical buffer {physical} grew past the ring's window "
+                f"({max_size} + {width} - 1)"
+            )
+        # Every round rejected the whole chain, so the chain bookkeeping and
+        # the counters agree.
+        stats = generator.get_mtp_stats()
+        assert stats["attempted"] == 40
+        assert stats["accepted"] == 0
+        assert stats["rejected"] == 80
+        assert draft_model.accept_lens == [0] * 40
+
+
+class TestMLLMLogprobs:
+    """Per-token logprobs: request-scoped, row-correct, off by default."""
+
+    @staticmethod
+    def _scheduler_with_request(logprobs, top_logprobs):
+        from vllm_mlx.mllm_scheduler import MLLMScheduler
+        from vllm_mlx.request import RequestStatus
+
+        scheduler = MLLMScheduler.__new__(MLLMScheduler)
+        scheduler._detokenizer_pool = {}
+        scheduler.uid_to_request_id = {0: "req-1"}
+        scheduler.total_completion_tokens = 0
+        scheduler.num_requests_processed = 0
+
+        def _decode(ids):
+            if isinstance(ids, int):
+                return f"t{ids}"
+            return f"t{ids[0]}"
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.decode.side_effect = _decode
+        mock_processor = MagicMock()
+        mock_processor.tokenizer = mock_tokenizer
+        scheduler.processor = mock_processor
+
+        mock_request = MagicMock()
+        mock_request.request_id = "req-1"
+        mock_request.output_tokens = []
+        mock_request.num_output_tokens = 0
+        mock_request.num_prompt_tokens = 0
+        mock_request.status = RequestStatus.RUNNING
+        mock_request.first_token_time = None
+        mock_request.mtp_drafts = 0
+        mock_request.mtp_accepted = 0
+        mock_request.logprobs = logprobs
+        mock_request.top_logprobs = top_logprobs
+        scheduler.running = {"req-1": mock_request}
+        return scheduler
+
+    def test_chat_request_accepts_logprobs_fields(self):
+        from vllm_mlx.api.models import ChatCompletionRequest
+
+        request = ChatCompletionRequest(
+            model="m",
+            messages=[{"role": "user", "content": "hi"}],
+            logprobs=True,
+            top_logprobs=2,
+        )
+        assert request.logprobs is True
+        assert request.top_logprobs == 2
+
+    def test_chunk_choice_omits_logprobs_unless_requested(self):
+        import json
+
+        from vllm_mlx.api.models import (
+            ChatCompletionChunkChoice,
+            ChatCompletionChunkDelta,
+            ChoiceLogprobs,
+        )
+
+        plain = ChatCompletionChunkChoice(delta=ChatCompletionChunkDelta(content="hi"))
+        # The default wire format must not carry a logprobs key at all.
+        assert "logprobs" not in plain.model_dump_json()
+
+        with_logprobs = ChatCompletionChunkChoice(
+            delta=ChatCompletionChunkDelta(content="hi"),
+            logprobs=ChoiceLogprobs(
+                content=[
+                    {
+                        "token": "t1",
+                        "logprob": -0.5,
+                        "token_id": 1,
+                        "top_logprobs": [
+                            {"token": "t1", "logprob": -0.5, "token_id": 1},
+                            {"token": "t2", "logprob": -1.5, "token_id": 2},
+                        ],
+                    }
+                ]
+            ),
+        )
+        payload = json.loads(with_logprobs.model_dump_json())
+        assert payload["logprobs"]["content"][0]["token_id"] == 1
+        assert len(payload["logprobs"]["content"][0]["top_logprobs"]) == 2
+
+    def test_process_batch_responses_reports_top_logprobs_of_the_token_row(self):
+        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
+
+        scheduler = self._scheduler_with_request(True, 2)
+        # The row the token was sampled from: token 1 wins, token 2 second.
+        resp = MLLMBatchResponse(
+            uid=0,
+            request_id="req-1",
+            token=1,
+            logprobs=mx.array([0.1, 0.7, 0.2]),
+            finish_reason=None,
+        )
+
+        outputs, finished = scheduler._process_batch_responses([resp])
+        assert not finished
+        entry = outputs[0].logprobs[0]
+        assert entry["token_id"] == 1
+        assert entry["token"] == "t1"
+        assert abs(entry["logprob"] - 0.7) < 1e-6
+        # The alternatives are ordered by decreasing logprob.
+        assert [item["token_id"] for item in entry["top_logprobs"]] == [1, 2]
+        assert abs(entry["top_logprobs"][0]["logprob"] - 0.7) < 1e-6
+        assert abs(entry["top_logprobs"][1]["logprob"] - 0.2) < 1e-6
+
+    def test_process_batch_responses_omits_logprobs_when_not_requested(self):
+        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
+
+        scheduler = self._scheduler_with_request(False, 0)
+        resp = MLLMBatchResponse(
+            uid=0,
+            request_id="req-1",
+            token=1,
+            logprobs=mx.array([0.1, 0.7, 0.2]),
+            finish_reason=None,
+        )
+
+        outputs, finished = scheduler._process_batch_responses([resp])
+        assert not finished
+        assert outputs[0].logprobs is None
+
+    def test_mtp_reports_the_row_that_produced_each_token(self, monkeypatch):
+        """Each emitted token carries the row of the forward that produced it.
+
+        The width-2 verify produces two rows: row 0 verifies the draft and
+        row 1 predicts the token after it. The accepted draft must report
+        row 0 and the token after it row 1 -- not the other way round.
+        """
+        from mlx_lm.sample_utils import make_sampler
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatch,
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            install_mtp_mllm,
+        )
+
+        monkeypatch.delenv("VLLM_MLX_MTP_B1_BYPASS", raising=False)
+        monkeypatch.delenv("VLLM_MLX_MTP_REJECT_DEFER", raising=False)
+
+        class LanguageModel:
+            def mtp_forward(self, hidden_states, next_token_ids, mtp_cache=None):
+                del next_token_ids, mtp_cache
+                batch_size = hidden_states.shape[0]
+                # The drafter proposes token 2.
+                return mx.array([[[0.0, 0.0, 4.0, -3.0]] for _ in range(batch_size)])
+
+            def __call__(self, input_tokens, cache=None, return_hidden=False, **kwargs):
+                del cache, kwargs
+                batch_size, seq_len = input_tokens.shape
+                logits = mx.full((batch_size, seq_len, 4), -3.0)
+                if seq_len == 1:
+                    # Primary forward: token 1 wins.
+                    logits[:, :, 1] = 4.0
+                else:
+                    # Verify: row 0 accepts the draft (token 2), row 1 gives
+                    # the token after it (token 3).
+                    logits[:, 0, 2] = 4.0
+                    logits[:, 1, 3] = 4.0
+                hidden = mx.zeros((batch_size, seq_len, 2))
+                return logits, hidden
+
+        class TrimmableCache:
+            def is_trimmable(self):
+                return True
+
+            def trim(self, count):
+                del count
+
+        model = LanguageModel()
+        generator = MLLMBatchGenerator(
+            model=model,
+            processor=None,
+            sampler=make_sampler(temp=0.0),
+            stop_tokens=set(),
+        )
+        install_mtp_mllm(generator, model)
+        request = MLLMBatchRequest(
+            uid=7,
+            request_id="r7",
+            prompt="",
+            max_tokens=8,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            mllm_draft=True,
+        )
+        generator.active_batch = MLLMBatch(
+            uids=[7],
+            request_ids=["r7"],
+            y=mx.array([0]),
+            logprobs=[mx.array([0.0, 0.0, 0.0, 0.0])],
+            max_tokens=[8],
+            num_tokens=[0],
+            cache=[TrimmableCache()],
+            requests=[request],
+            samplers=[make_sampler(temp=0.0)],
+        )
+
+        emitted = {}
+        for _ in range(3):
+            for response in generator.next():
+                emitted[response.token] = int(response.logprobs.argmax().item())
+
+        # Primary token -> the primary forward's row (token 1 wins there).
+        assert emitted[1] == 1
+        # Accepted draft -> the verify's row 0 (token 2 wins there).
+        assert emitted[2] == 2
+        # The token after the draft -> the verify's row 1 (token 3 wins there).
+        assert emitted[3] == 3
+
+
+class TestDrafterKvPositionArgs:
+    """The cheap-draft publication of the shared K/V to the assistant."""
+
+    def test_default_path_publishes_device_arrays(self):
+        from vllm_mlx.mllm_batch_generator import _drafter_kv_position_args
+
+        position, valid_len = _drafter_kv_position_args([700], False)
+
+        assert isinstance(position, mx.array)
+        assert isinstance(valid_len, mx.array)
+        assert int(position[0]) == 699
+        assert int(valid_len[0]) == 700
+
+    def test_cheap_single_lane_publishes_host_scalars(self):
+        from vllm_mlx.mllm_batch_generator import _drafter_kv_position_args
+
+        position, valid_len = _drafter_kv_position_args([700], True)
+
+        assert position == 699
+        assert valid_len == 700
+        assert isinstance(position, int)
+        assert isinstance(valid_len, int)
+
+    def test_cheap_multi_lane_keeps_the_array_path(self):
+        from vllm_mlx.mllm_batch_generator import _drafter_kv_position_args
+
+        position, valid_len = _drafter_kv_position_args([700, 640], True)
+
+        assert isinstance(position, mx.array)
+        assert isinstance(valid_len, mx.array)
+        assert [int(v) for v in valid_len] == [700, 640]
+
+
+class TestMtpCostGate:
+    """The cost-aware gate: speculate only while the measured cost pays."""
+
+    @staticmethod
+    def _gate(plain, round_s, accepted, rejected, depth=2, margin=1.05):
+        """A gate fed the measured samples of one build.
+
+        accepted/rejected are the drafts the rounds accepted and rejected, so
+        the per-draft acceptance is accepted / (accepted + rejected). The
+        samples are fed in the number the gate asks for before it decides.
+        """
+        from vllm_mlx.mtp_cost_gate import MtpCostGate
+
+        gate = MtpCostGate(depth=depth, margin=margin)
+        for _ in range(gate.min_round_samples):
+            gate.observe_round(round_s)
+        for _ in range(gate.min_plain_samples):
+            gate.observe_plain_step(plain)
+        gate.observe_acceptance(accepted, accepted + rejected)
+        # The gate wants a measured acceptance over a few drafts, not one.
+        while gate._drafted < gate.min_drafts:
+            gate.observe_acceptance(accepted, accepted + rejected)
+        return gate
+
+    def test_no_measurement_keeps_todays_behaviour(self):
+        """A missing measurement must never turn into a slower path."""
+        from vllm_mlx.mtp_cost_gate import MtpCostGate
+
+        gate = MtpCostGate(depth=2)
+        gate.begin_request(1)
+        assert gate.should_speculate() is True
+
+    def test_bootstrap_measures_both_paths(self):
+        """The gate measures the round first, then the plain path."""
+        from vllm_mlx.mtp_cost_gate import MtpCostGate
+
+        gate = MtpCostGate(depth=2)
+        # Nothing measured: speculate (today's behaviour) and measure T.
+        gate.begin_request(1)
+        assert gate.should_speculate() is True
+        # A request's first steps are dropped, so feed a few more.
+        for _ in range(gate.min_round_samples + gate.skip_first_samples):
+            gate.observe_round(0.0302)
+        gate.observe_acceptance(587, 587 + 413)
+        # T is measured but F is not: run the plain path and measure it.
+        gate.begin_request(2)
+        assert gate.should_speculate() is False
+        for _ in range(gate.min_plain_samples + gate.skip_first_samples):
+            gate.observe_plain_step(0.0128)
+        # Both measured: the rule decides.
+        gate.begin_request(3)
+        assert gate.should_speculate() is False
+
+    def test_rule_is_the_measured_break_even(self):
+        """a*F > s + d decides: the 8-bit build pays, the 4-bit build does not."""
+        # 8-bit build: F = 15.6 ms/token, the round costs 32.2 ms, the
+        # per-draft acceptance is 0.632 -> speculation pays.
+        eight_bit = self._gate(0.0156, 0.0322, 632, 368)
+        eight_bit.begin_request(1)
+        assert eight_bit.should_speculate() is True
+
+        # 4-bit build: F = 12.8 ms/token, the round costs 30.2 ms, the
+        # per-draft acceptance is 0.587 -> speculation does not pay.
+        four_bit = self._gate(0.0128, 0.0302, 587, 413)
+        four_bit.begin_request(1)
+        assert four_bit.should_speculate() is False
+
+    def test_marginal_cost_is_measured_not_assumed(self):
+        """s and d come from the measured samples."""
+        gate = self._gate(0.0156, 0.0322, 632, 368)
+        gate.observe_draft_cost(0.002)
+
+        s, d = gate.marginal_cost()
+
+        assert abs(s - (0.0322 - 0.0156 - 0.002) / 2) < 1e-9
+        assert abs(d - 0.001) < 1e-9
+        # The measured decomposition adds up to the round's extra cost over
+        # the plain step, per drafted token.
+        assert abs((s + d) - (0.0322 - 0.0156) / 2) < 1e-9
+
+    def test_acceptance_is_measured_from_the_drafts(self):
+        gate = self._gate(0.0156, 0.0322, 632, 368)
+
+        assert abs(gate.acceptance - 0.632) < 1e-9
+        assert gate.snapshot()["acceptance"] == gate.acceptance
+
+    def test_decision_is_latched_for_the_request(self):
+        """The gate never changes the arithmetic under a running request."""
+        gate = self._gate(0.0156, 0.0322, 632, 368)
+
+        gate.begin_request(7)
+        assert gate.should_speculate() is True
+        # The same request keeps the decision, whatever happens meanwhile.
+        gate.begin_request(7)
+        assert gate.should_speculate() is True
+        assert gate.snapshot()["requests"] == 1
+
+    def test_first_steps_of_a_request_are_not_measured(self):
+        """A request's first steps are not representative of its steady state."""
+        from vllm_mlx.mtp_cost_gate import MtpCostGate
+
+        gate = MtpCostGate(depth=2)
+        gate.begin_request(1)
+        gate.observe_round(0.090)
+        gate.observe_round(0.090)
+        assert gate.round_samples == 0
+        gate.observe_round(0.030)
+        assert gate.round_samples == 1
+        assert gate.plain_samples == 0
+
+    def test_recheck_measures_the_round_again(self):
+        """The gate re-measures the round now and then."""
+        gate = self._gate(0.0128, 0.0302, 587, 413, margin=1.05)
+        gate.recheck_every = 2
+
+        gate.begin_request(1)
+        assert gate.should_speculate() is False
+        # Every second request is a re-check: the round is measured again.
+        gate.begin_request(2)
+        assert gate.should_speculate() is True
+        gate.begin_request(3)
+        assert gate.should_speculate() is False
+
+    def test_snapshot_reports_the_measured_quantities(self):
+        gate = self._gate(0.0156, 0.0322, 632, 368)
+
+        snapshot = gate.snapshot()
+
+        assert snapshot["plain_step_ms"] == 15.6
+        assert snapshot["round_ms"] == 32.2
+        assert snapshot["enabled"] is True
+        assert snapshot["depth"] == 2
+
+    def test_gate_is_off_by_default_and_wired_into_the_mtp_path(self):
+        import inspect
+
+        from vllm_mlx import mllm_batch_generator
+
+        source = inspect.getsource(mllm_batch_generator.install_mtp_mllm)
+        assert "VLLM_MLX_MTP_COST_GATE" in source
+        assert "_cost_gate.should_speculate()" in source
+        assert "_cost_gate.observe_plain_step" in source
+        assert "_cost_gate.observe_round" in source

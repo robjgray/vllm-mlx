@@ -2991,6 +2991,194 @@ def _shared_kv_states(language_model: Any, cache: List[Any]) -> Dict[str, Any]:
     return shared
 
 
+def _shared_kv_source_layers(language_model: Any, cache: List[Any]) -> Dict[str, int]:
+    """Map each layer type to the cache entry the drafter actually shares.
+
+    The published shared-KV dict is keyed by layer type, so for every type
+    only the LAST layer that owns a cache survives in it; the layers before
+    it are dead work. Resolving the index once turns a publication from a
+    scan of every layer of the target into a read of the one layer per type
+    the drafter attends to.
+    """
+    layers = getattr(getattr(language_model, "model", None), "layers", []) or []
+    padded = list(cache)
+    if len(padded) < len(layers):
+        padded += [None] * (len(layers) - len(padded))
+    sources: Dict[str, int] = {}
+    for index, (layer, layer_cache) in enumerate(zip(layers, padded)):
+        if layer_cache is None or not hasattr(layer_cache, "state"):
+            continue
+        sources[layer.layer_type] = index
+    return sources
+
+
+def _mtp_lane_signature(batch_gen: Any) -> Optional[Tuple[Any, ...]]:
+    # Identity of the active batch's lanes.
+    #
+    # The publisher's cached batch metadata is only valid while the lane set
+    # is unchanged: a lane joining or leaving changes the batch's padding and
+    # therefore the published positions.
+    batch = getattr(batch_gen, "active_batch", None)
+    if batch is None:
+        return None
+    uids = getattr(batch, "uids", None)
+    if not uids:
+        return None
+    return tuple(uids)
+
+
+class _SharedKVPublisher:
+    """Publishes the target's KV state to the external MTP drafter.
+
+    The drafter needs, per layer type, the target's K/V for the committed
+    prefix. Publishing that view the obvious way re-derives it from every
+    layer of the target on every step and reads the batch's offsets and
+    padding back from the device: the offset read is a synchronisation and
+    the drafter's own normalisation of the shared K/V performs two more per
+    published layer type. At B=1 those round trips cost more than the
+    drafter's forward.
+
+    This publisher keeps the batch metadata on the host instead. The cache's
+    device offset and its append counter advance by the same amount (both
+    grow by the appended tokens and shrink by the rolled-back ones), so the
+    per-lane positions can be tracked from the counter alone, and the batch
+    is read from the device once per batch instead of once per step.
+
+    The published K/V stay live views of the target's cache, so a rejected
+    draft's rollback is picked up automatically: the next publication reads
+    the rolled-back buffers, never a stale copy.
+
+    The fast path only applies to a single-lane batch whose lane is not
+    left-padded. In that case the drafter's normalisation of the shared K/V
+    is provably a no-op (it returns the very tensors it was given), so it is
+    skipped instead of being paid for on every step. Every other shape
+    falls back to the device-side publication.
+    """
+
+    def __init__(self, language_model: Any) -> None:
+        self._language_model = language_model
+        self._sources: Optional[Dict[str, int]] = None
+        self._signature: Optional[Tuple[Any, ...]] = None
+        self._leaf: Any = None
+        self._offset: Optional[int] = None
+        self._counter: Optional[int] = None
+        self._padding: Optional[int] = None
+
+    def reset(self) -> None:
+        """Forget the cached batch state (new batch or new cache topology)."""
+        self._sources = None
+        self._signature = None
+        self._leaf = None
+        self._offset = None
+        self._counter = None
+        self._padding = None
+
+    @staticmethod
+    def _counter_of(leaf: Any) -> Optional[int]:
+        """Host-side count of the tokens appended to a batch cache leaf.
+
+        A rotating leaf counts every token it ever wrote in ``_offset`` while
+        ``_idx`` is its physical write cursor, so ``_offset`` is checked
+        first; an append-only leaf only has ``_idx``.
+        """
+        for name in ("_offset", "_idx"):
+            value = getattr(leaf, name, None)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+        return None
+
+    @staticmethod
+    def _offset_leaf(cache: List[Any]) -> Any:
+        """The leaf whose offset the drafter's positions are read from."""
+        from mlx_vlm.speculative.cache_state import iter_leaf_caches
+
+        for candidate in iter_leaf_caches(cache):
+            if getattr(candidate, "offset", None) is not None:
+                return candidate
+        return None
+
+    def _refresh(
+        self, cache: List[Any], batch_size: int, leaf: Any
+    ) -> bool:
+        """Read the batch's offsets and padding from the device.
+
+        This is the one device round trip the publisher needs per batch; the
+        per-step publication afterwards is host-side arithmetic.
+        """
+        counter = self._counter_of(leaf)
+        offset = getattr(leaf, "offset", None)
+        # The padding the drafter would be handed is the first cache entry's
+        # (mlx_vlm's _batch_cache_left_padding), not the offset leaf's.
+        padding = None
+        for entry in cache:
+            candidate_padding = getattr(entry, "left_padding", None)
+            if candidate_padding is not None:
+                padding = candidate_padding
+                break
+        if counter is None or not isinstance(offset, mx.array):
+            return False
+        if isinstance(padding, mx.array):
+            mx.eval(offset, padding)
+            pads = [int(v) for v in padding.tolist()]
+        else:
+            mx.eval(offset)
+            pads = [0] * batch_size
+        offsets = [int(v) for v in offset.tolist()]
+        if len(offsets) != batch_size or len(pads) != batch_size:
+            return False
+        self._leaf = leaf
+        self._offset = offsets[0]
+        self._counter = counter
+        self._padding = pads[0]
+        return True
+
+    def publish(
+        self,
+        cache: List[Any],
+        batch_size: int,
+        signature: Optional[Tuple[Any, ...]],
+    ) -> Optional[Tuple[Dict[str, Any], int, List[int]]]:
+        """Return ``(shared_kv, kv_offset, positions)`` for the drafter.
+
+        ``None`` means the fast path does not apply to this batch and the
+        caller must use the device-side publication.
+        """
+        if batch_size != 1:
+            return None
+        leaf = self._offset_leaf(cache)
+        if leaf is None:
+            return None
+        if self._signature != signature or leaf is not self._leaf:
+            self.reset()
+            self._signature = signature
+            if not self._refresh(cache, batch_size, leaf):
+                self.reset()
+                return None
+            self._sources = _shared_kv_source_layers(self._language_model, cache)
+        if self._sources is None or self._leaf is None:
+            return None
+        if self._padding is None or self._padding > 0:
+            # A left-padded lane makes the drafter's normalisation roll the
+            # published K/V and zero its tail: it is not a no-op there.
+            return None
+        counter = self._counter_of(self._leaf)
+        if counter is None or self._offset is None or self._counter is None:
+            return None
+        positions = [self._offset + (counter - self._counter)]
+        shared: Dict[str, Any] = {}
+        for layer_type, index in self._sources.items():
+            layer_cache = cache[index]
+            state = layer_cache.state
+            if not state or len(state) < 2 or state[0] is None:
+                continue
+            keys, values = state[0], state[1]
+            keys, values = _temporal_kv_view(layer_cache, keys, values)
+            shared[layer_type] = (keys, values)
+        if not shared:
+            return None
+        return shared, positions[0], positions
+
+
 def _holds_recurrent_state(cache: Any) -> bool:
     """Whether a cache leaf keeps state that appended tokens cannot rewind.
 
@@ -3080,9 +3268,47 @@ def _rollback_appended_tokens(caches: List[Any], count: int) -> bool:
                 ),
             )
         cache._idx -= count
-        cache._offset -= count
+        # A ring places the next write at ``_offset`` whenever it has to grow
+        # a buffer that is shorter than ``max_size``, so after the splice
+        # ``_offset`` has to be the number of tokens the buffer now holds.
+        # The running total is already past ``max_size`` once the window has
+        # wrapped, and sizing that growth from it yields a negative dimension
+        # ("Negative dimensions not allowed") on the next decode step.
+        if cache._idx < cache.max_size:
+            cache._offset = cache._idx
+        else:
+            cache._offset -= count
         cache.offset -= count
     return True
+
+
+def _drafter_kv_position_args(
+    positions: List[int], cheap: bool
+) -> Tuple[Any, Any]:
+    """The position/kv_valid_len the assistant drafter is published with.
+
+    The drafter's mask builder (make_drafter_masks) reads the valid length
+    off the DEVICE when it is handed an array, and it builds an additive
+    bias for the full-attention layer over the whole published K/V. With a
+    single lane both are avoidable: the lane's valid length is a host scalar,
+    so the builder takes its scalar path, the full-attention bias is not
+    built at all, and no device read-back is needed.
+
+    The masks are the same either way. The array path masks exactly the keys
+    at or beyond the valid length (and offsets the key index by
+    valid - kv_len); the scalar path masks the same keys, and returns no mask
+    at all when the published K/V is exactly the valid prefix. The drafted
+    tokens are therefore unchanged.
+
+    "cheap" is the operator gate (VLLM_MLX_MTP_CHEAP_DRAFT=1); the default
+    path is the array path, byte for byte.
+    """
+    if cheap and len(positions) == 1:
+        pos = int(positions[0])
+        return max(pos - 1, 0), pos
+    from mlx_vlm.speculative.mtp import _mtp_draft_position
+
+    return _mtp_draft_position(mx.array(positions)), mx.array(positions)
 
 
 def _draft_external_mtp_active_batch(
@@ -3091,20 +3317,31 @@ def _draft_external_mtp_active_batch(
     hidden_states: mx.array,
     positions: List[int],
     sampler: Callable,
+    block_size: int = 2,
 ) -> mx.array:
-    """Draft one token per row without conflating mixed KV positions."""
+    """Draft one token per row without conflating mixed KV positions.
+
+    ``block_size`` is the assistant's speculative block: the drafter runs
+    ``block_size - 1`` assistant forwards and returns that many tokens per
+    row (the HF ``SinglePositionMultiTokenCandidateGenerator`` shape). The
+    default of 2 is the shipped one-token draft; a larger block returns the
+    whole chain, ``[rows, block_size - 1]``.
+    """
     from mlx_vlm.speculative.mtp import _mtp_draft_block_active
 
-    return _mtp_draft_block_active(
+    drafted = _mtp_draft_block_active(
         draft_model,
         primary_tokens.tolist(),
         hidden_states[:, -1:, :],
-        2,
+        block_size,
         sampler,
         primary_tokens.dtype,
         positions,
         greedy_sampling=True,
-    )[:, 0]
+    )
+    if block_size <= 2:
+        return drafted[:, 0]
+    return drafted
 
 
 def install_mtp_mllm(
@@ -3133,6 +3370,55 @@ def install_mtp_mllm(
     _orig_step = batch_gen._step
     _draft_sampler = make_sampler(temp=0.0)
     external_drafter = draft_model is not None
+    # Cheap draft (VLLM_MLX_MTP_CHEAP_DRAFT=1): publish the shared K/V to the
+    # assistant drafter with HOST scalars when the batch has a single lane,
+    # so the drafter's mask builder takes its scalar path (no device
+    # read-back of the valid length, no full-attention bias). The masks and
+    # therefore the drafted tokens are unchanged. Off by default.
+    _cheap_draft = os.environ.get("VLLM_MLX_MTP_CHEAP_DRAFT") == "1"
+    # Incremental shared-KV publication: publish only the layers the drafter
+    # shares and track the batch's positions on the host, so the publication
+    # costs no device synchronisation. Off by default.
+    _incremental_kv = os.environ.get("VLLM_MLX_MTP_INCREMENTAL_KV") == "1"
+    _publisher = _SharedKVPublisher(language_model)
+    # Deep drafting: VLLM_MLX_MTP_DRAFT_DEPTH=K (>1) drafts K tokens per
+    # round and verifies them in ONE width-(K+1) target forward, the primary
+    # taken from that forward's row 0. K=1 is the shipped one-token draft and
+    # stays the default.
+    try:
+        _draft_depth = int(os.environ.get("VLLM_MLX_MTP_DRAFT_DEPTH", "1") or 1)
+    except ValueError:
+        _draft_depth = 1
+    if _draft_depth < 1:
+        _draft_depth = 1
+    # Cost-aware gate (VLLM_MLX_MTP_COST_GATE=1): speculate only while the
+    # MEASURED cost and acceptance say the round pays for itself. The gate
+    # reads the target's own measured step times (the plain path's per-token
+    # cost, the round's cost, the drafter's cost) and the observed
+    # acceptance, so the same build works on a fast target (no speculation)
+    # and on a slow one (speculation). Off by default: without the env var
+    # the path is byte-for-byte the shipped one.
+    _cost_gate = None
+    if os.environ.get("VLLM_MLX_MTP_COST_GATE") == "1":
+        from .mtp_cost_gate import MtpCostGate
+
+        try:
+            _cost_gate_margin = float(
+                os.environ.get("VLLM_MLX_MTP_COST_GATE_MARGIN", "1.05")
+            )
+        except ValueError:
+            _cost_gate_margin = 1.05
+        try:
+            _cost_gate_recheck = int(
+                os.environ.get("VLLM_MLX_MTP_COST_GATE_RECHECK", "8")
+            )
+        except ValueError:
+            _cost_gate_recheck = 8
+        _cost_gate = MtpCostGate(
+            depth=_draft_depth,
+            margin=_cost_gate_margin,
+            recheck_every=_cost_gate_recheck,
+        )
     if external_drafter:
         batch_gen._require_uniform_mllm_draft = True
         batch_gen._allow_mid_batch_extend = False
@@ -3179,6 +3465,44 @@ def install_mtp_mllm(
     _deferred_drafts: Dict[int, dict] = {}
     _attempted_drafts_by_uid: Dict[int, int] = {}
 
+    # Native multi-token step (VLLM_MLX_MTP_NATIVE_STEP=1, B==1 only).
+    # OptiQ's spec loop keeps the committed state of the lane in three
+    # locals (cur, prev_lp, h_prev) and emits the accepted draft in the
+    # step that verified it. _native_slot is the single-lane equivalent of
+    # those locals: one entry, dropped when the lane changes, carrying the
+    # next token to feed (already an int), the logprobs that produced it
+    # and the hidden the drafter consumes. _native_emit carries the tokens
+    # the step committed, so the response layer can publish them in the
+    # same step instead of deferring them to the next one.
+    _native_slot: Optional[dict] = None
+    _native_emit: Optional[dict] = None
+
+    # Cost gate measurement state. The gate measures the wall-clock interval
+    # between two decode steps: the interval after a plain step is the plain
+    # path's per-token cost (F), the interval after a speculative round is
+    # the round's cost (T). A step's kind is recorded when it finishes and
+    # the interval is sampled when the next step starts.
+    _gate_last_at: Optional[float] = None
+    _gate_last_kind: Optional[str] = None
+    _gate_last_uids: Optional[Tuple[Any, ...]] = None
+    _gate_since_prefill = 0
+    _gate_instrumented = False
+
+    # Optional per-step host-side profiler (VLLM_MLX_MTP_STEP_PROFILE=1).
+    # MLX's mx.eval does not block on this build, so a phase timer measures
+    # the graph enqueue; the accept round-trip additionally includes the GPU
+    # drain its host sync waits for. The counters are the structural part:
+    # how many target calls and how many host syncs a step costs.
+    _profile_on = os.environ.get("VLLM_MLX_MTP_STEP_PROFILE") == "1"
+    _profile: Dict[str, float] = {}
+    _profile_counts: Dict[str, int] = {}
+
+    def _prof_add(key: str, seconds: float) -> None:
+        if not _profile_on:
+            return
+        _profile[key] = _profile.get(key, 0.0) + seconds
+        _profile_counts[key] = _profile_counts.get(key, 0) + 1
+
     # MTP stats. These are intentionally exposed through get_mtp_stats() so
     # /v1/status can distinguish "weights injected" from useful draft work.
     _mtp_stats_lock = threading.Lock()
@@ -3187,9 +3511,12 @@ def install_mtp_mllm(
         "prefill": 0,
         "no_active_batch": 0,
         "concurrent_batch": 0,
+        "multi_lane": 0,
         "logits_processors": 0,
         "assistant_not_requested": 0,
-    }
+        "all_paused_bypass": 0,
+        "cost_gate_bypass": 0,
+}
 
     def _get_mtp_stats() -> Dict[str, Any]:
         with _mtp_stats_lock:
@@ -3203,7 +3530,8 @@ def install_mtp_mllm(
         return {
             "enabled": True,
             "requested_draft_tokens": num_draft_tokens,
-            "effective_draft_tokens": 1,
+            "effective_draft_tokens": _draft_depth,
+            "draft_depth": _draft_depth,
             "implementation": (
                 "external_assistant" if external_drafter else "native_target_head"
             ),
@@ -3215,6 +3543,15 @@ def install_mtp_mllm(
             "acceptance_rate": acceptance_rate,
             "bypass_counts": bypass_counts,
             "bypass_counts_semantics": "per_condition_overlapping_not_total_steps",
+            "cost_gate": (
+                _cost_gate.snapshot() if _cost_gate is not None else None
+            ),
+            "step_profile": (
+                {k: round(v, 6) for k, v in _profile.items()} if _profile_on else None
+            ),
+            "step_profile_counts": (
+                dict(_profile_counts) if _profile_on else None
+            ),
         }
 
     batch_gen.get_mtp_stats = _get_mtp_stats
@@ -3228,7 +3565,47 @@ def install_mtp_mllm(
         rope_deltas: Optional[mx.array] = None,
     ) -> Tuple[mx.array, List[mx.array]]:
         """Extended _step with MTP always-advance strategy."""
+        nonlocal _native_slot, _native_emit
+        nonlocal _gate_last_at, _gate_last_kind, _gate_last_uids
+        nonlocal _gate_since_prefill, _gate_instrumented
         batch_size = input_tokens.shape[0]
+        # Cost gate bookkeeping: the interval between two decode steps is the
+        # cost of the step that just finished. It is sampled when the next
+        # step starts, because the step's kind is only known once it has
+        # finished. An interval that spans a request boundary (the batch's
+        # lanes changed) says nothing about a step, so it is dropped.
+        if _cost_gate is not None:
+            _gate_now = time.perf_counter()
+            _gate_uids = (
+                tuple(getattr(batch_gen.active_batch, "uids", ()) or ())
+                if batch_gen.active_batch is not None
+                else ()
+            )
+            if _gate_last_at is not None and _gate_last_uids == _gate_uids:
+                _gate_interval = _gate_now - _gate_last_at
+                if _gate_last_kind == "round":
+                    if not _gate_instrumented:
+                        _cost_gate.observe_round(_gate_interval)
+                elif _gate_last_kind == "plain":
+                    _cost_gate.observe_plain_step(_gate_interval)
+            _gate_last_at = _gate_now
+            _gate_last_uids = _gate_uids
+            _gate_instrumented = False
+            _cost_gate.note_step()
+            if len(_gate_uids) == 1:
+                # A new request latches the gate's decision for it.
+                if _cost_gate.begin_request(_gate_uids[0]):
+                    logger.info(
+                        "[MTP-COST-GATE] request %s: speculate=%s %s",
+                        _gate_uids[0],
+                        _cost_gate.should_speculate(),
+                        _cost_gate.snapshot(),
+                    )
+            if input_tokens.shape[1] > 1:
+                _gate_since_prefill = 0
+            else:
+                _gate_since_prefill += 1
+        _prof_t_start = time.perf_counter()
         model_kwargs = {"rope_deltas": rope_deltas} if rope_deltas is not None else {}
         active_requests = (
             list(batch_gen.active_batch.requests)
@@ -3262,6 +3639,23 @@ def install_mtp_mllm(
             and batch_gen.active_batch is not None
             and len(batch_gen.active_batch.uids) == 1
         )
+        # Never-slower floor (VLLM_MLX_MTP_SINGLE_LANE_ONLY=1, default off).
+        # The accept decision is BATCH-WIDE: one lane's reject rolls the draft
+        # column out of EVERY lane and the accepted lanes never emit their
+        # verified draft, so the extra-token rate falls as p^B. Measured on the
+        # 8-bit drain cell with the full stack and the cost gate ON: aggregate
+        # 0.479 of plain, with 7 accepted drafts against 484 rejected ones -
+        # speculation is LOSS-MAKING whenever the batch holds more than one
+        # lane. The cost gate cannot protect this case, because the gate is
+        # only consulted for a single lane, so a multi-lane batch never asks
+        # it. The upstream per-row trim plus a fork-side per-lane accept
+        # lifts the same cell to 1.009 of plain (measured, 10 lanes); until
+        # that lands, a multi-lane batch takes the plain path.
+        multi_lane_bypass = (
+            os.environ.get("VLLM_MLX_MTP_SINGLE_LANE_ONLY") == "1"
+            and batch_gen.active_batch is not None
+            and len(batch_gen.active_batch.uids) > 1
+        )
         logits_processors_bypass = logits_processors is not None and any(
             logits_processors
         )
@@ -3285,6 +3679,26 @@ def install_mtp_mllm(
             or not all(request.mllm_draft for request in active_requests)
             or mrope_media_bypass
         )
+        # Cost-aware gate: speculate only while the measured round pays for
+        # itself. The decision is latched for the whole request (begin_request
+        # above), so the gate never changes the arithmetic under a running
+        # request. The gate only speaks for a single lane: any other shape
+        # keeps the shipped behaviour.
+        _gate_bypass = False
+        if (
+            _cost_gate is not None
+            and external_drafter
+            and not prefill_bypass
+            and batch_gen.active_batch is not None
+            and len(batch_gen.active_batch.uids) == 1
+            and input_tokens.shape[1] == 1
+            and not logits_processors_bypass
+            and not assistant_not_requested_bypass
+            and not mrope_media_bypass
+            and not all_paused_bypass
+        ):
+            if not _cost_gate.should_speculate():
+                _gate_bypass = True
         if (
             prefill_bypass
             or all_paused_bypass
@@ -3292,6 +3706,8 @@ def install_mtp_mllm(
             or logits_processors_bypass
             or assistant_not_requested_bypass
          or single_row_bypass
+         or multi_lane_bypass
+         or _gate_bypass
         ):
             # Keep the descriptions near the guards so operator-facing
             # telemetry stays dynamic instead of duplicating code predicates:
@@ -3310,6 +3726,10 @@ def install_mtp_mllm(
                     _bypass_counts["assistant_not_requested"] += 1
                 if single_row_bypass:
                     _bypass_counts["concurrent_batch"] += 1
+                if multi_lane_bypass:
+                    _bypass_counts["multi_lane"] += 1
+                if _gate_bypass:
+                    _bypass_counts["cost_gate_bypass"] += 1
             if all_paused_bypass and os.environ.get("VLLM_MLX_MTP_B1_RESUME") == "1":
                 # Ledger #13: a deferred reject pauses speculation for ONE
                 # step. At B==1 the paused lane is the only lane in the batch,
@@ -3319,6 +3739,23 @@ def install_mtp_mllm(
                 # then 43 plain steps for a 64-token request). Clear the marker
                 # so the lane resumes drafting on the next step.
                 batch_gen._reject_paused_uids = set()
+            if _gate_bypass:
+                # The cost gate took the plain path. The native slot carries
+                # the committed token of the speculative path as an int; the
+                # plain path re-derives the token from the cache, so the slot
+                # has to be dropped or the next speculative step would feed a
+                # stale token.
+                _native_slot = None
+                _native_emit = None
+            # A plain step measures the plain path's per-token cost, but only
+            # in the steady state: the first decode step after a prefill runs
+            # the post-prefill forward, which is not the step the rest of the
+            # decode pays.
+            _gate_last_kind = (
+                "plain"
+                if (not prefill_bypass and _gate_since_prefill >= 2)
+                else "skip"
+            )
             _skip_state_by_uid.clear()
             original_step_kwargs = (
                 {"rope_deltas": rope_deltas} if rope_deltas is not None else {}
@@ -3333,6 +3770,24 @@ def install_mtp_mllm(
             )
 
         current_uids = list(batch_gen.active_batch.uids)
+        # Native multi-token step: OptiQ's shape (same-step emission +
+        # trim-and-continue) for a single greedy lane. Any other shape
+        # (a concurrent batch, stochastic sampling, no external drafter)
+        # keeps the shipped path untouched.
+        native = (
+            os.environ.get("VLLM_MLX_MTP_NATIVE_STEP") == "1"
+            and external_drafter
+            and len(current_uids) == 1
+            and batch_size == 1
+            and not any(
+                _request_uses_stochastic_sampling(request)
+                for request in active_requests
+            )
+        )
+        if native and _native_slot is not None:
+            if _native_slot.get("uid") != current_uids[0]:
+                # The slot belongs to another request; drop it.
+                _native_slot = None
         # Ledger #78: paused (rejected-last-step) lanes run a full forward this
         # step and resume drafting from it; clear their pause marker.
         _paused_now = getattr(batch_gen, "_reject_paused_uids", set()) or set()
@@ -3356,56 +3811,79 @@ def install_mtp_mllm(
             )
             skip_entries = []
 
-        if skip_entries and all(skip_entries):
-            logits = mx.concatenate([entry["logits"] for entry in skip_entries], axis=0)
-            hidden_states = mx.concatenate(
-                [entry["hidden"] for entry in skip_entries], axis=0
-            )
+        _prof_t = time.perf_counter()
+        if native and _native_slot is not None:
+            # The committed lane state IS this step's primary: the token to
+            # feed next (already an int), the logprobs that produced it and
+            # the hidden the drafter consumes. No forward, no re-sampling
+            # and no host round-trip on the way in - the token the previous
+            # step verified is reused as-is.
+            _native_from_state = True
+            _native_token = int(_native_slot["token"])
+            primary_tokens = mx.array([_native_token], dtype=mx.uint32)
+            logprobs = _native_slot["logprobs"][None, :]
+            hidden_states = _native_slot["hidden"][None, :, :]
         else:
-            # Normal forward with return_hidden
-            model_output = language_model(
-                input_tokens, cache=cache, return_hidden=True, **model_kwargs
-            )
-            logits, hidden_states = _model_parts(model_output)
-            if hidden_states is None:
-                original_step_kwargs = (
-                    {"rope_deltas": rope_deltas} if rope_deltas is not None else {}
+            _native_from_state = False
+            if skip_entries and all(skip_entries):
+                logits = mx.concatenate(
+                    [entry["logits"] for entry in skip_entries], axis=0
                 )
-                return _orig_step(
-                    input_tokens,
-                    cache,
-                    logits_processors,
-                    output_tokens,
-                    samplers,
-                    **original_step_kwargs,
+                hidden_states = mx.concatenate(
+                    [entry["hidden"] for entry in skip_entries], axis=0
                 )
-            logits = logits[:, -1, :]
+            else:
+                # Normal forward with return_hidden
+                model_output = language_model(
+                    input_tokens, cache=cache, return_hidden=True, **model_kwargs
+                )
+                logits, hidden_states = _model_parts(model_output)
+                if hidden_states is None:
+                    _gate_last_kind = "skip"
+                    original_step_kwargs = (
+                        {"rope_deltas": rope_deltas} if rope_deltas is not None else {}
+                    )
+                    return _orig_step(
+                        input_tokens,
+                        cache,
+                        logits_processors,
+                        output_tokens,
+                        samplers,
+                        **original_step_kwargs,
+                    )
+                logits = logits[:, -1, :]
 
-        # Apply logits processors before sampling
-        if logits_processors and output_tokens and any(logits_processors):
-            processed_logits = []
-            for e in range(batch_size):
-                sample_logits = logits[e : e + 1]
-                if logits_processors[e]:
-                    for processor in logits_processors[e]:
-                        sample_logits = processor(
-                            mx.array(output_tokens[e]), sample_logits
-                        )
-                processed_logits.append(sample_logits)
-            logits = mx.concatenate(processed_logits, axis=0)
+            # Apply logits processors before sampling
+            if logits_processors and output_tokens and any(logits_processors):
+                processed_logits = []
+                for e in range(batch_size):
+                    sample_logits = logits[e : e + 1]
+                    if logits_processors[e]:
+                        for processor in logits_processors[e]:
+                            sample_logits = processor(
+                                mx.array(output_tokens[e]), sample_logits
+                            )
+                    processed_logits.append(sample_logits)
+                logits = mx.concatenate(processed_logits, axis=0)
 
-        # Sample primary (use per-request sampler if available)
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        if samplers and any(samplers):
-            sampled_list = []
-            for e in range(logprobs.shape[0]):
-                s = samplers[e] if samplers[e] else batch_gen.sampler
-                sampled_list.append(s(logprobs[e : e + 1]))
-            primary_tokens = mx.concatenate(sampled_list, axis=0)
-        else:
-            primary_tokens = batch_gen.sampler(logprobs)
+            # Sample primary (use per-request sampler if available)
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            if samplers and any(samplers):
+                sampled_list = []
+                for e in range(logprobs.shape[0]):
+                    s = samplers[e] if samplers[e] else batch_gen.sampler
+                    sampled_list.append(s(logprobs[e : e + 1]))
+                primary_tokens = mx.concatenate(sampled_list, axis=0)
+            else:
+                primary_tokens = batch_gen.sampler(logprobs)
+            if native:
+                # The drafter consumes this token as an int; the native
+                # commit publishes it in the same step.
+                _native_token = int(primary_tokens.tolist()[0])
+        _prof_add("primary", time.perf_counter() - _prof_t)
 
         # MTP draft + always-advance verify
+        _gate_drafted = False
         try:
             with _mtp_stats_lock:
                 _mtp_stats["attempted"] += 1
@@ -3414,22 +3892,66 @@ def install_mtp_mllm(
                 for request in active_requests
             ]
             uses_stochastic_sampling = any(sampled_rows)
+            # Deep (multi-token) drafting: the Ollama-shaped round. Draft K
+            # tokens ahead and verify them in ONE width-(K+1) target forward,
+            # with the primary taken from that forward's row 0 - there is no
+            # separate base-logits forward on this path. The round is only
+            # exactly reproducible when:
+            #   * the external assistant drafter (the native head has no
+            #     chain to draft),
+            #   * B == 1: the accept chain is a per-lane scalar, so a single
+            #     lane is what the chain bookkeeping below is written for,
+            #   * greedy: a stochastic draft needs the residual-sampling
+            #     machinery per position, not per round,
+            #   * pure attention: a recurrent stack would need a snapshot
+            #     restore at the accepted position, not at the round's start,
+            #   * the reject-defer + resume-reject branch: the lane keeps
+            #     drafting after a reject, so a partial accept is a trim of
+            #     the rejected tail rather than a paused lane.
+            _deep = (
+                _draft_depth > 1
+                and external_drafter
+                and batch_size == 1
+                and len(current_uids) == 1
+                and not uses_stochastic_sampling
+                and not any(_holds_recurrent_state(c) for c in cache)
+                and os.environ.get("VLLM_MLX_MTP_REJECT_DEFER") == "1"
+                and os.environ.get("VLLM_MLX_MTP_RESUME_REJECT") == "1"
+            )
             if external_drafter:
                 from mlx_vlm.speculative.common import _batch_cache_left_padding
                 from mlx_vlm.speculative.mtp import _mtp_draft_position
 
-                shared_kv = _shared_kv(cache)
+                _prof_t = time.perf_counter()
+                published = None
+                if _incremental_kv:
+                    published = _publisher.publish(
+                        cache, batch_size, _mtp_lane_signature(batch_gen)
+                    )
+                if published is not None:
+                    shared_kv, max_position, positions = published
+                    # The drafter's own normalisation of the shared K/V is a
+                    # no-op for a single unpadded lane (it returns the very
+                    # tensors it was handed), so it is skipped instead of
+                    # synchronising with the device on every step.
+                    left_padding = None
+                else:
+                    shared_kv = _shared_kv(cache)
+                    max_position, positions = _cache_positions(cache, batch_size)
+                    left_padding = _batch_cache_left_padding(cache)
                 if not shared_kv:
                     raise RuntimeError(
                         "Assistant MTP requires target shared-KV state from the batch cache"
                     )
-                max_position, positions = _cache_positions(cache, batch_size)
+                _position, _kv_valid_len = _drafter_kv_position_args(
+                    positions, _cheap_draft
+                )
                 draft_model.set_shared_kv(
                     shared_kv,
                     kv_offset=max_position,
-                    position=_mtp_draft_position(mx.array(positions)),
-                    kv_valid_len=mx.array(positions),
-                    left_padding=_batch_cache_left_padding(cache),
+                    position=_position,
+                    kv_valid_len=_kv_valid_len,
+                    left_padding=left_padding,
                 )
                 # Sample-and-compare preserves the target distribution here only
                 # because the external draft is a point mass. Changing greedy=True
@@ -3448,6 +3970,8 @@ def install_mtp_mllm(
                 # hidden reaches the external drafter, so both paths agree.
                 from mlx_vlm.speculative.mtp import _mtp_draft_hidden
 
+                _prof_add("publish", time.perf_counter() - _prof_t)
+                _prof_t = time.perf_counter()
                 draft_hidden = _mtp_draft_hidden(language_model, hidden_states)
                 draft_tokens = _draft_external_mtp_active_batch(
                     draft_model,
@@ -3455,7 +3979,18 @@ def install_mtp_mllm(
                     draft_hidden,
                     positions,
                     _draft_sampler,
+                    block_size=(_draft_depth + 1) if _deep else 2,
                 )
+                _prof_add("draft", time.perf_counter() - _prof_t)
+                if _cost_gate is not None and _cost_gate.should_instrument():
+                    # Measure the drafter's own cost. Forcing its forward here
+                    # exposes the host's verify-graph build on this round, so
+                    # the round's own timing is dropped (the drafter's cost is
+                    # still measured).
+                    _gate_t = time.perf_counter()
+                    mx.eval(draft_tokens)
+                    _cost_gate.observe_draft_cost(time.perf_counter() - _gate_t)
+                    _gate_instrumented = True
                 draft_distribution = None
             else:
                 draft_logits = language_model.mtp_forward(
@@ -3480,9 +4015,9 @@ def install_mtp_mllm(
                 )
                 draft_tokens = _draft_sampler(draft_logprobs)
             for uid in current_uids:
-                # Current MLLM MTP drafts one token per primary step. Keep this
-                # as a count so future multi-token drafters can report >1.
-                _attempted_drafts_by_uid[uid] = 1
+                # The deep path drafts a chain of _draft_depth tokens per
+                # primary step; the shipped path drafts exactly one.
+                _attempted_drafts_by_uid[uid] = _draft_depth if _deep else 1
 
             # Snapshot only genuinely recurrent state. Pure-attention stacks
             # (gemma-4: KVCache + RotatingKVCache) are rewound in place on
@@ -3496,9 +4031,18 @@ def install_mtp_mllm(
                     ]
 
             # Verify [primary, draft]
-            verify_input = mx.concatenate(
-                [primary_tokens[:, None], draft_tokens[:, None]], axis=1
-            )
+            if _deep:
+                # One fused width-(K+1) forward: the primary position plus the
+                # whole drafted chain. Row i of its output is the target's own
+                # distribution at position i, so row i verifies draft i+1 and
+                # row K is the bonus token.
+                verify_input = mx.concatenate(
+                    [primary_tokens[:, None], draft_tokens], axis=1
+                )
+            else:
+                verify_input = mx.concatenate(
+                    [primary_tokens[:, None], draft_tokens[:, None]], axis=1
+                )
             _pipe = os.environ.get("VLLM_MLX_MTP_PIPELINE2") == "1"
             if _pipe and batch_size >= 8 and not prefill_bypass and rope_deltas is not None:
                 # Ledger #80: like #79's two-group interleave, but the rope
@@ -3522,20 +4066,24 @@ def install_mtp_mllm(
                     else None
                 )
             else:
+                _prof_t = time.perf_counter()
                 verify_output = language_model(
                     verify_input, cache=cache, return_hidden=True, **model_kwargs
                 )
                 verify_logits, verify_hidden = _model_parts(verify_output)
+                _prof_add("verify", time.perf_counter() - _prof_t)
 
             # Verify in each request's sampler space. The old argmax equality
             # check was valid only for greedy decoding and silently bypassed
             # Qwen's normal temperature/top-p/top-k requests.
-            draft_list = draft_tokens.tolist()
+            draft_list = None if _deep else draft_tokens.tolist()
             # Per-row emitted suffix for the drafted position: (token, logprob
             # source, accepted). Empty for the all-greedy batch path, where the
             # next step's argmax already reproduces greedy decoding.
             emitted_by_uid: Dict[int, tuple] = {}
-            if uses_stochastic_sampling and external_drafter:
+            if _deep:
+                pass
+            elif uses_stochastic_sampling and external_drafter:
                 draft_list = draft_tokens.tolist()
                 verify_distribution = mx.concatenate(
                     [
@@ -3614,12 +4162,149 @@ def install_mtp_mllm(
                 # One host round-trip for the whole accept decision: building
                 # both token lists and comparing them in Python cost two, and
                 # every draft acceptance on a greedy request hits this line.
-                verify_pred = mx.argmax(verify_logits[:, 0, :], axis=-1)
-                accepted_rows = (verify_pred == draft_tokens.reshape(-1)).tolist()
-                all_accepted = all(accepted_rows)
-                draft_list = draft_tokens.tolist()
+                if native:
+                    # OptiQ's single sync (the shipped one-draft round): the
+                    # argmax over BOTH verified rows yields the accept decision
+                    # (row 0) and the token to feed next (row 1) from one host
+                    # round-trip, so the next step needs no sampling pass of
+                    # its own.
+                    native_verify_tokens = mx.argmax(
+                        verify_logits, axis=-1
+                    ).tolist()[0]
+                    draft_list = draft_tokens.tolist()
+                    accepted_rows = [native_verify_tokens[0] == draft_list[0]]
+                    all_accepted = accepted_rows[0]
+                else:
+                    verify_pred = mx.argmax(verify_logits[:, 0, :], axis=-1)
+                    accepted_rows = (verify_pred == draft_tokens.reshape(-1)).tolist()
+                    all_accepted = all(accepted_rows)
+                    draft_list = draft_tokens.tolist()
 
-            if all_accepted and verify_hidden is not None:
+            if _deep:
+                # Chain acceptance in ONE sync: the argmax over rows 0..K of
+                # the fused forward yields the chain decisions (row i verifies
+                # draft i+1) AND the next round's primary (the row at the end
+                # of the accepted chain), so the committed token is already an
+                # int when the round ends.
+                if verify_hidden is None:
+                    raise RuntimeError(
+                        "deep MTP drafting requires the target's hidden states"
+                    )
+                _pred = mx.argmax(
+                    verify_logits[:, : _draft_depth + 1, :], axis=-1
+                )
+                mx.eval(_pred, draft_tokens)
+                _pred_list = _pred.tolist()[0]
+                _chain = draft_tokens.tolist()[0]
+                _accepted = 0
+                for _i in range(_draft_depth):
+                    if int(_pred_list[_i]) != int(_chain[_i]):
+                        break
+                    _accepted += 1
+                _uid = current_uids[0]
+                if _accepted < _draft_depth:
+                    # The fused forward appended [primary, d1..dK]; only the
+                    # accepted prefix stays in the cache.
+                    _rejected = _draft_depth - _accepted
+                    if not _rollback_appended_tokens(cache, _rejected):
+                        for c in cache:
+                            if (
+                                hasattr(c, "is_trimmable")
+                                and c.is_trimmable()
+                                and hasattr(c, "trim")
+                            ):
+                                c.trim(_rejected)
+                # The next round's primary comes from the row at the end of the
+                # accepted chain: on a full accept that is the bonus row, on a
+                # partial accept it is the row whose draft was rejected - the
+                # target's own choice for the first mismatching position.
+                _next = _accepted
+                if native:
+                    # The native step carries the committed token as an int:
+                    # the next round reuses it instead of re-deriving it from
+                    # the stored [1, V] logits row, and the hidden the drafter
+                    # consumes rides along with it (no extra host round trip).
+                    _next_lp = verify_logits[0, _next] - mx.logsumexp(
+                        verify_logits[0, _next], axis=-1, keepdims=True
+                    )
+                    _native_slot = {
+                        "uid": _uid,
+                        "token": int(_pred_list[_next]),
+                        "logprobs": _next_lp,
+                        "hidden": verify_hidden[0, _next : _next + 1, :],
+                    }
+                else:
+                    _skip_state_by_uid[_uid] = {
+                        "logits": verify_logits[0, _next : _next + 1, :],
+                        "hidden": verify_hidden[0:1, _next : _next + 1, :],
+                    }
+                # Each accepted draft is published as the deferred suffix; its
+                # logprobs are the row that verified it.
+                _chain_lp = verify_logits[:, :_draft_depth, :] - mx.logsumexp(
+                    verify_logits[:, :_draft_depth, :], axis=-1, keepdims=True
+                )
+                mx.async_eval(_chain_lp)
+                _deferred_drafts[_uid] = {
+                    "tokens": [
+                        (int(_chain[_i]), _chain_lp[0, _i, :], True)
+                        for _i in range(_accepted)
+                    ]
+                }
+                with _mtp_stats_lock:
+                    _mtp_stats["accepted"] += _accepted
+                    _mtp_stats["rejected"] += _draft_depth - _accepted
+                if _cost_gate is not None:
+                    _cost_gate.observe_acceptance(_accepted, _draft_depth)
+                if external_drafter:
+                    draft_model.accept_lens.append(_accepted)
+                    draft_model.draft_lens.append(_draft_depth)
+            elif native and verify_hidden is not None:
+                # Native step: commit the verified tokens in THIS step and
+                # keep going. A rejected draft is trimmed to the committed
+                # length and the correction token becomes the next primary,
+                # so the lane keeps drafting - no paused lane, no deferred
+                # state, no extra forward.
+                accepted = bool(all_accepted)
+                n = 1 if accepted else 0
+                verify_lp = verify_logits - mx.logsumexp(
+                    verify_logits, axis=-1, keepdims=True
+                )
+                if not accepted:
+                    if not _rollback_appended_tokens(cache, 1):
+                        for c in cache:
+                            if (
+                                hasattr(c, "is_trimmable")
+                                and c.is_trimmable()
+                                and hasattr(c, "trim")
+                            ):
+                                c.trim(1)
+                    for _ci, _snap in _rnn_snapshots.items():
+                        cache[_ci].state = _snap
+                _native_slot = {
+                    "uid": current_uids[0],
+                    "token": int(native_verify_tokens[n]),
+                    "logprobs": verify_lp[0, n],
+                    "hidden": verify_hidden[0, n : n + 1, :],
+                }
+                _native_emit = {
+                    "uid": current_uids[0],
+                    "token": int(_native_token),
+                    "logprobs": logprobs[0],
+                    "draft": int(draft_list[0]) if accepted else None,
+                    "draft_logprobs": verify_lp[0, 0] if accepted else None,
+                    "replace_stale": _native_from_state,
+                }
+                with _mtp_stats_lock:
+                    if accepted:
+                        _mtp_stats["accepted"] += 1
+                    else:
+                        _mtp_stats["rejected"] += 1
+                if _cost_gate is not None:
+                    _cost_gate.observe_acceptance(1 if accepted else 0, 1)
+                if external_drafter:
+                    draft_model.accept_lens.append(1 if accepted else 0)
+                    draft_model.draft_lens.append(1)
+            elif all_accepted and verify_hidden is not None:
                 # ACCEPT
                 mx.async_eval(verify_logits[:, 1, :], verify_hidden[:, -1:, :])
                 verify_lp = verify_logits[:, 0, :] - mx.logsumexp(
@@ -3641,6 +4326,8 @@ def install_mtp_mllm(
                     }
                 with _mtp_stats_lock:
                     _mtp_stats["accepted"] += 1
+                if _cost_gate is not None:
+                    _cost_gate.observe_acceptance(1, 1)
                 if external_drafter:
                     draft_model.accept_lens.append(1)
                     draft_model.draft_lens.append(1)
@@ -3684,18 +4371,32 @@ def install_mtp_mllm(
                     # rejected draft columns in the physical ring (phantom keys on
                     # the next temporal reorder). Fall back to the splice-based
                     # rollback for those.
-                    if not _rollback_appended_tokens(cache, 1):
+                    #
+                    # The PAUSE branch discards this step's skip state and runs
+                    # a FULL forward on the next step, and the base generator
+                    # feeds that forward the token this step emitted -- which
+                    # the verify forward has already appended. Rolling back
+                    # only the draft therefore leaves the cache one token ahead
+                    # of the committed stream, and the next forward appends
+                    # that token a SECOND time: the context carries a duplicate
+                    # token and every later rotary position is shifted by one.
+                    # The paused lane re-feeds the primary, so the draft AND the
+                    # primary must be dropped here. The RESUME branch keeps the
+                    # skip state (no forward; the correction is emitted from the
+                    # verify row-0), so it only drops the draft.
+                    _resume = os.environ.get("VLLM_MLX_MTP_RESUME_REJECT") == "1"
+                    _rollback_n = 1 if _resume else 2
+                    if not _rollback_appended_tokens(cache, _rollback_n):
                         for c in cache:
                             if (
                                 hasattr(c, "is_trimmable")
                                 and c.is_trimmable()
                                 and hasattr(c, "trim")
                             ):
-                                c.trim(1)
+                                c.trim(_rollback_n)
                     for _ci, _snap in _rnn_snapshots.items():
                         cache[_ci].state = _snap
                     _deferred_paused = getattr(batch_gen, "_reject_paused_uids", set())
-                    _resume = os.environ.get("VLLM_MLX_MTP_RESUME_REJECT") == "1"
                     if verify_hidden is not None:
                         for row, uid in enumerate(current_uids):
                             if not accepted_rows[row]:
@@ -3713,6 +4414,8 @@ def install_mtp_mllm(
                         batch_gen._reject_paused_uids = _deferred_paused
                     with _mtp_stats_lock:
                         _mtp_stats["rejected"] += 1
+                    if _cost_gate is not None:
+                        _cost_gate.observe_acceptance(0, 1)
                     # handled: skip the whole replay block below
                     import sys as _sys
                     _mtp_step_done = True
@@ -3845,9 +4548,12 @@ def install_mtp_mllm(
                         }
                 with _mtp_stats_lock:
                     _mtp_stats["rejected"] += 1
+                if _cost_gate is not None:
+                    _cost_gate.observe_acceptance(0, 1)
                 if external_drafter:
                     draft_model.accept_lens.append(0)
                     draft_model.draft_lens.append(1)
+            _gate_drafted = True
 
         except Exception as e:
             logger.warning(f"[MTP-MLLM] draft/verify failed: {e}")
@@ -3867,14 +4573,126 @@ def install_mtp_mllm(
                 f"[MTP-MLLM] stats: accepted={acc} rejected={rej} "
                 f"errors={err} acceptance={rate:.0f}%"
             )
+            if _cost_gate is not None:
+                logger.info("[MTP-COST-GATE] %s", _cost_gate.snapshot())
+
+        # The step that just finished was a speculative round: its interval is
+        # the round's cost. An instrumented round is dropped: forcing the
+        # drafter's forward there exposes the host's verify-graph build, so
+        # that round's interval is not the round's cost.
+        _gate_last_kind = (
+            "round" if (_gate_drafted and not _gate_instrumented) else "skip"
+        )
 
         return primary_tokens, list(logprobs)
+
+    def _native_publish(
+        responses: List[MLLMBatchResponse], emit: dict
+    ) -> Tuple[List[MLLMBatchResponse], bool]:
+        """Publish the tokens a native step committed, in the same step.
+
+        The base generator emits the token it fed the model one round late
+        (the CB response layer is one step behind the forward). In the native
+        shape that stale token was already published by the previous step, so
+        it is replaced by this step's primary; the accepted draft is
+        appended in the same step. The step therefore publishes exactly the
+        tokens its own forward committed, in position order.
+        """
+        uid = emit["uid"]
+        batch = batch_gen.active_batch
+        index = None
+        if batch is not None:
+            for e, bu in enumerate(batch.uids):
+                if bu == uid:
+                    index = e
+                    break
+        request = batch.requests[index] if index is not None else None
+        published: List[MLLMBatchResponse] = []
+        ended = False
+        for r in responses:
+            if r.uid != uid:
+                published.append(r)
+                continue
+            base_finish = r.finish_reason
+            if not emit.get("replace_stale"):
+                # The base's response carries the token the PREVIOUS step
+                # sampled (the CB response layer is one step behind the
+                # forward) and this step's primary is a different, new
+                # token. Both are real tokens of this stream, so both are
+                # published - and both have to be counted, or the emitted
+                # stream runs one token ahead of the request's budget.
+                published.append(r)
+                if base_finish is not None:
+                    ended = True
+                    continue
+                if index is not None and request is not None:
+                    batch.num_tokens[index] += 1
+                    request.output_tokens.append(emit["token"])
+                    request.num_tokens = batch.num_tokens[index]
+            elif request is not None:
+                # The base counted and logged the stale token; this step
+                # committed a different one in its place.
+                if request.output_tokens:
+                    request.output_tokens[-1] = emit["token"]
+                request.num_tokens = batch.num_tokens[index]
+            finish = None
+            if emit["token"] in batch_gen.stop_tokens:
+                finish = "stop"
+            elif r.finish_reason is not None:
+                # The base's response ended the request (its token budget or
+                # a stop token) and the base already dropped the lane from
+                # the batch. The native emission replaces the base's stale
+                # token, but it must NOT swallow that finish: the client
+                # would wait for a [DONE] that never comes and the request
+                # would hang with its budget already exceeded.
+                finish = r.finish_reason
+            published.append(
+                MLLMBatchResponse(
+                    uid=r.uid,
+                    request_id=r.request_id,
+                    token=emit["token"],
+                    logprobs=emit["logprobs"],
+                    finish_reason=finish,
+                    from_draft=False,
+                    prompt_tokens=r.prompt_tokens,
+                    specprefill_outcome=r.specprefill_outcome,
+                )
+            )
+            if finish is not None:
+                ended = True
+            draft_token = emit.get("draft")
+            if draft_token is not None and finish is None:
+                draft_finish = None
+                if draft_token in batch_gen.stop_tokens:
+                    draft_finish = "stop"
+                if index is not None:
+                    batch.num_tokens[index] += 1
+                    request.output_tokens.append(draft_token)
+                    request.num_tokens = batch.num_tokens[index]
+                    if batch.num_tokens[index] >= batch.max_tokens[index]:
+                        draft_finish = "length"
+                published.append(
+                    MLLMBatchResponse(
+                        uid=r.uid,
+                        request_id=r.request_id,
+                        token=draft_token,
+                        logprobs=emit["draft_logprobs"],
+                        finish_reason=draft_finish,
+                        from_draft=True,
+                        prompt_tokens=r.prompt_tokens,
+                        specprefill_outcome=r.specprefill_outcome,
+                    )
+                )
+                if draft_finish is not None:
+                    ended = True
+        return published, ended
 
     # Wrap _next to emit deferred MTP drafts
     batch_gen._inner_next = batch_gen._next
 
     def _mtp_next() -> List[MLLMBatchResponse]:
         """Wrapper around _next that emits deferred MTP draft tokens."""
+        nonlocal _native_emit
         if batch_gen.active_batch is None:
             _skip_state_by_uid.clear()
             _deferred_drafts.clear()
@@ -3905,6 +4723,17 @@ def install_mtp_mllm(
         # skip-state eviction sweep below still needs to run unconditionally
         # so a request that finishes on a step with no pending deferred draft
         # doesn't leave its skip-state entry lingering.
+        native_end_uids: set = set()
+        if _native_emit is not None:
+            # Native step: publish the tokens THIS step committed - the
+            # accepted draft included - instead of deferring them to the
+            # next response round.
+            emit = _native_emit
+            _native_emit = None
+            responses, native_ended = _native_publish(responses, emit)
+            if native_ended:
+                native_end_uids.add(emit["uid"])
+
         augmented: List[MLLMBatchResponse] = responses
         draft_end_uids: set = set()
 
@@ -3922,25 +4751,35 @@ def install_mtp_mllm(
 
                 if uid in prev_deferred:
                     draft_info = prev_deferred.pop(uid)
-                    draft_t = draft_info["token"]
-                    draft_lp = draft_info["logprobs"]
-                    from_draft = draft_info.get("from_draft", True)
-
-                    if draft_t in batch_gen.stop_tokens:
-                        augmented.append(
-                            MLLMBatchResponse(
-                                uid=uid,
-                                request_id=r.request_id,
-                                token=draft_t,
-                                logprobs=draft_lp,
-                                finish_reason="stop",
-                                from_draft=from_draft,
-                                prompt_tokens=r.prompt_tokens,
-                                specprefill_outcome=r.specprefill_outcome,
+                    # The deep path publishes the whole accepted chain; the
+                    # shipped path publishes a single draft.
+                    entries = draft_info.get("tokens")
+                    if entries is None:
+                        entries = [
+                            (
+                                draft_info["token"],
+                                draft_info["logprobs"],
+                                draft_info.get("from_draft", True),
                             )
-                        )
-                        draft_end_uids.add(uid)
-                    else:
+                        ]
+
+                    for draft_t, draft_lp, from_draft in entries:
+                        if draft_t in batch_gen.stop_tokens:
+                            augmented.append(
+                                MLLMBatchResponse(
+                                    uid=uid,
+                                    request_id=r.request_id,
+                                    token=draft_t,
+                                    logprobs=draft_lp,
+                                    finish_reason="stop",
+                                    from_draft=from_draft,
+                                    prompt_tokens=r.prompt_tokens,
+                                    specprefill_outcome=r.specprefill_outcome,
+                                )
+                            )
+                            draft_end_uids.add(uid)
+                            break
+
                         draft_finish = None
                         batch = batch_gen.active_batch
                         if batch is not None:
@@ -3965,6 +4804,8 @@ def install_mtp_mllm(
                                 specprefill_outcome=r.specprefill_outcome,
                             )
                         )
+                        if draft_finish is not None:
+                            break
 
             # Store prefix caches for draft-ended sequences BEFORE filtering
             if draft_end_uids and batch_gen.active_batch is not None:
@@ -3984,6 +4825,26 @@ def install_mtp_mllm(
                     batch_gen.active_batch.filter(keep)
                 else:
                     batch_gen.active_batch = None
+
+        if native_end_uids and batch_gen.active_batch is not None:
+            # The native lane ended on a stop token or its token budget:
+            # store its prefix cache and drop it from the batch.
+            end_indices = [
+                e
+                for e, u in enumerate(batch_gen.active_batch.uids)
+                if u in native_end_uids
+            ]
+            batch_gen._maybe_store_prefix_cache(batch_gen.active_batch, end_indices)
+
+            keep = [
+                e
+                for e, u in enumerate(batch_gen.active_batch.uids)
+                if u not in native_end_uids
+            ]
+            if keep:
+                batch_gen.active_batch.filter(keep)
+            else:
+                batch_gen.active_batch = None
 
         active_uids = (
             set(batch_gen.active_batch.uids)
