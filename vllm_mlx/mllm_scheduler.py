@@ -143,9 +143,14 @@ class MLLMSchedulerConfig:
     max_video_frames: int = 128
     # Enable MTP speculative decoding
     enable_mtp: bool = False
-    # Bypass MTP (draft+verify) when the active batch is a single request:
-    # measured never-slower (ledger #46/#50, ratio 1.00 = parity at B==1).
-    mllm_mtp_b1_bypass: bool = True
+    # Bypass MTP (draft+verify) when the active batch is a single request.
+    # This static switch is no longer the default: speculation at B=1 is
+    # decided by the MEASURED cost gate (vllm_mlx/mtp_cost_gate.py), which
+    # drafts only while the round pays for itself on this build - measured
+    # 1.10 of plain on the 8-bit build and 1.00 on the 4-bit one, i.e. never
+    # slower than plain. Set this to True (or VLLM_MLX_MTP_B1_BYPASS=1) to
+    # restore the old "never speculate at B=1" behaviour.
+    mllm_mtp_b1_bypass: bool = False
     # Number of draft tokens for MTP
     mtp_num_draft_tokens: int = 1
     # Enable KV prefix cache for text-only requests

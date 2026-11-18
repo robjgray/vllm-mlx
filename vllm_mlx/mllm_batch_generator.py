@@ -3344,6 +3344,20 @@ def _draft_external_mtp_active_batch(
     return drafted
 
 
+def _mtp_flag(name: str, default: bool = True) -> bool:
+    """Read an MTP feature flag. On this branch the flags default ON.
+
+    The measured configuration IS the ON configuration - every number in the
+    campaign was taken with the gates enabled - so the defaults are the ones
+    the measurements describe and an operator can still turn any of them off
+    with an env var set to "0" (or on with "1").
+    """
+    value = os.environ.get(name)
+    if value in ("0", "1"):
+        return value == "1"
+    return default
+
+
 def install_mtp_mllm(
     batch_gen: "MLLMBatchGenerator",
     language_model: Any,
@@ -3375,18 +3389,18 @@ def install_mtp_mllm(
     # so the drafter's mask builder takes its scalar path (no device
     # read-back of the valid length, no full-attention bias). The masks and
     # therefore the drafted tokens are unchanged. Off by default.
-    _cheap_draft = os.environ.get("VLLM_MLX_MTP_CHEAP_DRAFT") == "1"
+    _cheap_draft = _mtp_flag("VLLM_MLX_MTP_CHEAP_DRAFT")
     # Incremental shared-KV publication: publish only the layers the drafter
     # shares and track the batch's positions on the host, so the publication
     # costs no device synchronisation. Off by default.
-    _incremental_kv = os.environ.get("VLLM_MLX_MTP_INCREMENTAL_KV") == "1"
+    _incremental_kv = _mtp_flag("VLLM_MLX_MTP_INCREMENTAL_KV")
     _publisher = _SharedKVPublisher(language_model)
     # Deep drafting: VLLM_MLX_MTP_DRAFT_DEPTH=K (>1) drafts K tokens per
     # round and verifies them in ONE width-(K+1) target forward, the primary
     # taken from that forward's row 0. K=1 is the shipped one-token draft and
     # stays the default.
     try:
-        _draft_depth = int(os.environ.get("VLLM_MLX_MTP_DRAFT_DEPTH", "1") or 1)
+        _draft_depth = int(os.environ.get("VLLM_MLX_MTP_DRAFT_DEPTH", "2") or 2)
     except ValueError:
         _draft_depth = 1
     if _draft_depth < 1:
@@ -3399,7 +3413,7 @@ def install_mtp_mllm(
     # and on a slow one (speculation). Off by default: without the env var
     # the path is byte-for-byte the shipped one.
     _cost_gate = None
-    if os.environ.get("VLLM_MLX_MTP_COST_GATE") == "1":
+    if _mtp_flag("VLLM_MLX_MTP_COST_GATE"):
         from .mtp_cost_gate import MtpCostGate
 
         try:
@@ -3652,7 +3666,7 @@ def install_mtp_mllm(
         # lifts the same cell to 1.009 of plain (measured, 10 lanes); until
         # that lands, a multi-lane batch takes the plain path.
         multi_lane_bypass = (
-            os.environ.get("VLLM_MLX_MTP_SINGLE_LANE_ONLY") == "1"
+            _mtp_flag("VLLM_MLX_MTP_SINGLE_LANE_ONLY")
             and batch_gen.active_batch is not None
             and len(batch_gen.active_batch.uids) > 1
         )
@@ -3669,7 +3683,7 @@ def install_mtp_mllm(
         _active_uids = set(batch_gen.active_batch.uids) if batch_gen.active_batch else set()
         _drafting_uids = _active_uids - _paused
         all_paused_bypass = (
-            os.environ.get("VLLM_MLX_MTP_REJECT_DEFER") == "1"
+            _mtp_flag("VLLM_MLX_MTP_REJECT_DEFER")
             and external_drafter
             and active_requests
             and not _drafting_uids
@@ -3730,7 +3744,7 @@ def install_mtp_mllm(
                     _bypass_counts["multi_lane"] += 1
                 if _gate_bypass:
                     _bypass_counts["cost_gate_bypass"] += 1
-            if all_paused_bypass and os.environ.get("VLLM_MLX_MTP_B1_RESUME") == "1":
+            if all_paused_bypass and _mtp_flag("VLLM_MLX_MTP_B1_RESUME"):
                 # Ledger #13: a deferred reject pauses speculation for ONE
                 # step. At B==1 the paused lane is the only lane in the batch,
                 # so this plain-path bypass was taken -- and the pause marker
@@ -3775,7 +3789,7 @@ def install_mtp_mllm(
         # (a concurrent batch, stochastic sampling, no external drafter)
         # keeps the shipped path untouched.
         native = (
-            os.environ.get("VLLM_MLX_MTP_NATIVE_STEP") == "1"
+            _mtp_flag("VLLM_MLX_MTP_NATIVE_STEP")
             and external_drafter
             and len(current_uids) == 1
             and batch_size == 1
@@ -3915,8 +3929,8 @@ def install_mtp_mllm(
                 and len(current_uids) == 1
                 and not uses_stochastic_sampling
                 and not any(_holds_recurrent_state(c) for c in cache)
-                and os.environ.get("VLLM_MLX_MTP_REJECT_DEFER") == "1"
-                and os.environ.get("VLLM_MLX_MTP_RESUME_REJECT") == "1"
+                and _mtp_flag("VLLM_MLX_MTP_REJECT_DEFER")
+                and _mtp_flag("VLLM_MLX_MTP_RESUME_REJECT")
             )
             if external_drafter:
                 from mlx_vlm.speculative.common import _batch_cache_left_padding
@@ -4353,7 +4367,7 @@ def install_mtp_mllm(
                         axis=1,
                     )
 
-                _reject_defer = os.environ.get("VLLM_MLX_MTP_REJECT_DEFER") == "1"
+                _reject_defer = _mtp_flag("VLLM_MLX_MTP_REJECT_DEFER")
                 if _reject_defer and not all_accepted and "accepted_rows" not in locals():
                     # Stochastic-sampled reject path has no per-row accepted_rows;
                     # every row in emitted_by_uid is a reject there by construction.
@@ -4384,7 +4398,7 @@ def install_mtp_mllm(
                     # primary must be dropped here. The RESUME branch keeps the
                     # skip state (no forward; the correction is emitted from the
                     # verify row-0), so it only drops the draft.
-                    _resume = os.environ.get("VLLM_MLX_MTP_RESUME_REJECT") == "1"
+                    _resume = _mtp_flag("VLLM_MLX_MTP_RESUME_REJECT")
                     _rollback_n = 1 if _resume else 2
                     if not _rollback_appended_tokens(cache, _rollback_n):
                         for c in cache:

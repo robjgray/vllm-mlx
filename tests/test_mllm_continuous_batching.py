@@ -35,6 +35,30 @@ except ImportError:
 
 pytestmark = pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 
+# The MTP feature flags default ON on the feature/mtp-wins branch (that is the
+# measured configuration - every number in the campaign was taken with them
+# enabled). The tests below predate the branch and were written against the
+# old defaults, so pin those here; a test that wants a specific configuration
+# sets the env var itself, and monkeypatch applies this fixture first, so an
+# explicit setenv in a test still wins.
+_MTP_BRANCH_FLAGS = (
+    "VLLM_MLX_MTP_CHEAP_DRAFT",
+    "VLLM_MLX_MTP_INCREMENTAL_KV",
+    "VLLM_MLX_MTP_COST_GATE",
+    "VLLM_MLX_MTP_SINGLE_LANE_ONLY",
+    "VLLM_MLX_MTP_REJECT_DEFER",
+    "VLLM_MLX_MTP_RESUME_REJECT",
+    "VLLM_MLX_MTP_NATIVE_STEP",
+    "VLLM_MLX_MTP_B1_RESUME",
+)
+
+
+@pytest.fixture(autouse=True)
+def _pin_mtp_flags_to_pre_branch_defaults(monkeypatch):
+    for name in _MTP_BRANCH_FLAGS:
+        monkeypatch.setenv(name, "0")
+    monkeypatch.setenv("VLLM_MLX_MTP_DRAFT_DEPTH", "1")
+
 
 # Test image (small PNG)
 TEST_IMAGE_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
@@ -2488,7 +2512,10 @@ class TestMLLMBatchGeneratorMTPGuards:
 
         monkeypatch.setenv("VLLM_MLX_MTP_REJECT_DEFER", "1")
         monkeypatch.setenv("VLLM_MLX_MTP_B1_BYPASS", "0")
-        monkeypatch.delenv("VLLM_MLX_MTP_RESUME_REJECT", raising=False)
+        # Pin the resume path OFF explicitly rather than relying on a default:
+        # the branch defaults the flag ON, and this test exercises the pause
+        # branch, which is the path taken when the lane does NOT resume.
+        monkeypatch.setenv("VLLM_MLX_MTP_RESUME_REJECT", "0")
 
         monkeypatch.setattr(
             speculative_common, "_batch_cache_left_padding", lambda cache: None
@@ -5684,3 +5711,61 @@ class TestMtpCostGate:
         assert "_cost_gate.should_speculate()" in source
         assert "_cost_gate.observe_plain_step" in source
         assert "_cost_gate.observe_round" in source
+
+
+class TestBranchDefaults:
+    """The feature/mtp-wins branch: the measured configuration is the default.
+
+    On the branch the MTP feature flags default ON (the configuration every
+    campaign number was measured with), the static "never speculate at B=1"
+    switch defaults OFF, and the cost gate - not the switch - decides whether
+    a round pays for itself.
+    """
+
+    FLAGS = _MTP_BRANCH_FLAGS
+
+    def _drop_flags(self, monkeypatch):
+        """Remove the flags so the code's own defaults apply."""
+        for name in self.FLAGS:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv("VLLM_MLX_MTP_DRAFT_DEPTH", raising=False)
+        monkeypatch.delenv("VLLM_MLX_MTP_B1_BYPASS", raising=False)
+
+    def test_flags_default_on_and_the_env_var_overrides(self, monkeypatch):
+        from vllm_mlx.mllm_batch_generator import _mtp_flag
+
+        monkeypatch.delenv("VLLM_MLX_MTP_COST_GATE", raising=False)
+        assert _mtp_flag("VLLM_MLX_MTP_COST_GATE") is True
+        monkeypatch.setenv("VLLM_MLX_MTP_COST_GATE", "0")
+        assert _mtp_flag("VLLM_MLX_MTP_COST_GATE") is False
+        monkeypatch.setenv("VLLM_MLX_MTP_COST_GATE", "1")
+        assert _mtp_flag("VLLM_MLX_MTP_COST_GATE") is True
+
+    def test_the_default_install_drafts_a_two_token_chain(self, monkeypatch):
+        from vllm_mlx.mllm_batch_generator import install_mtp_mllm
+
+        self._drop_flags(monkeypatch)
+
+        class FakeBatchGen:
+            def __init__(self):
+                self._step = MagicMock(
+                    return_value=(mx.array([7]), [mx.array([0.1, 0.9])])
+                )
+                self._next = MagicMock(return_value=[])
+                self.active_batch = MagicMock()
+                self.active_batch.__len__.return_value = 1
+                self.active_batch.requests = [
+                    MagicMock(temperature=0.0, top_p=1.0, top_k=0, min_p=0.0)
+                ]
+                self.sampler = MagicMock()
+
+        batch_gen = FakeBatchGen()
+        install_mtp_mllm(batch_gen, MagicMock(), num_draft_tokens=4)
+
+        # The deep-drafting default (K=2), not the shipped single draft.
+        assert batch_gen.get_mtp_stats()["effective_draft_tokens"] == 2
+
+    def test_the_static_b1_switch_is_off_by_default(self):
+        from vllm_mlx.mllm_scheduler import MLLMSchedulerConfig
+
+        assert MLLMSchedulerConfig().mllm_mtp_b1_bypass is False
